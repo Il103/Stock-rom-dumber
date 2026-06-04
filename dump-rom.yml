@@ -1,0 +1,349 @@
+name: HyperOS ROM Dumper
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_type:
+        description: 'ROM Type'
+        required: true
+        type: choice
+        options:
+          - recovery   # ZIP containing payload.bin
+          - fastboot   # TGZ/ZIP containing sparse .img files
+
+      rom_url:
+        description: 'Direct ROM download URL'
+        required: true
+        type: string
+
+      release_tag:
+        description: 'Release tag  (e.g. HyperOS-spinel-V816.0.4.0.UNACNXM)'
+        required: true
+        type: string
+
+      device_name:
+        description: 'Device codename (e.g. spinel)'
+        required: false
+        default: 'unknown'
+        type: string
+
+      convert_sparse:
+        description: 'Convert sparse → raw (fastboot only)'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+      compress_images:
+        description: 'Compress images with xz before upload'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  dump-rom:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+
+      # ── 0. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 1. Free disk space (~20 GB freed) ─────────────────────────────────
+      - name: Free disk space
+        run: |
+          echo ":: Disk before cleanup"
+          df -h /
+
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/share/swift \
+            /usr/local/.ghcup \
+            "$AGENT_TOOLSDIRECTORY"
+
+          sudo docker image prune --all --force 2>/dev/null || true
+          sudo apt-get clean -qq
+
+          echo ":: Disk after cleanup"
+          df -h /
+
+      # ── 2. Install base deps ───────────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            aria2 unzip tar python3 xz-utils \
+            android-sdk-libsparse-utils
+
+      # ── 3. Install payload-dumper-go (recovery only) ──────────────────────
+      - name: Install payload-dumper-go
+        if: inputs.rom_type == 'recovery'
+        run: |
+          echo ":: Fetching latest payload-dumper-go release..."
+          ASSET_URL=$(curl -fsSL https://api.github.com/repos/ssut/payload-dumper-go/releases/latest \
+            | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          assets = data.get('assets', [])
+          match = [
+              a['browser_download_url']
+              for a in assets
+              if 'linux' in a['name'] and 'amd64' in a['name']
+          ]
+          print(match[0] if match else '')
+          ")
+
+          if [ -z "$ASSET_URL" ]; then
+            echo "ERROR: Could not find payload-dumper-go linux/amd64 asset"
+            exit 1
+          fi
+
+          echo ":: Downloading: $ASSET_URL"
+          wget -q "$ASSET_URL" -O /tmp/pdg.tar.gz
+          tar -xzf /tmp/pdg.tar.gz -C /tmp/
+          chmod +x /tmp/payload-dumper-go
+          sudo mv /tmp/payload-dumper-go /usr/local/bin/
+          payload-dumper-go --version || true
+
+      # ── 4. Download ROM ────────────────────────────────────────────────────
+      - name: Download ROM
+        run: |
+          mkdir -p rom_dl
+          echo ":: Downloading from:"
+          echo "   ${{ inputs.rom_url }}"
+          echo ""
+
+          aria2c \
+            --file-allocation=none \
+            -x 16 -s 16 -k 4M \
+            --retry-wait=5 --max-tries=5 \
+            --console-log-level=warn \
+            --summary-interval=30 \
+            --dir=rom_dl \
+            --out=rom_archive \
+            "${{ inputs.rom_url }}"
+
+          echo ""
+          echo ":: Downloaded:"
+          ls -lh rom_dl/
+          df -h /
+
+      # ── 5a. Recovery ROM → extract payload.bin → dump images ──────────────
+      - name: "[Recovery] Extract payload.bin and dump images"
+        if: inputs.rom_type == 'recovery'
+        run: |
+          mkdir -p out/images
+
+          echo ":: Locating payload.bin inside ZIP..."
+          PAYLOAD_ENTRY=$(unzip -l rom_dl/rom_archive | awk '{print $4}' | grep -i "payload\.bin" | head -1)
+
+          if [ -z "$PAYLOAD_ENTRY" ]; then
+            echo "ERROR: payload.bin not found in the ZIP archive"
+            unzip -l rom_dl/rom_archive | tail -30
+            exit 1
+          fi
+
+          echo ":: Found: $PAYLOAD_ENTRY"
+          echo ":: Extracting payload.bin (this may take a while)..."
+          unzip -p rom_dl/rom_archive "$PAYLOAD_ENTRY" > /tmp/payload.bin
+
+          echo ":: payload.bin size: $(du -h /tmp/payload.bin | cut -f1)"
+          df -h /
+
+          echo ":: Dumping partition images..."
+          payload-dumper-go -output out/images /tmp/payload.bin
+
+          rm -f /tmp/payload.bin
+          rm -rf rom_dl/
+
+          echo ""
+          echo ":: Extracted images:"
+          ls -lh out/images/
+
+      # ── 5b. Fastboot ROM → extract archives → collect .img files ──────────
+      - name: "[Fastboot] Extract ROM archive"
+        if: inputs.rom_type == 'fastboot'
+        run: |
+          mkdir -p out/images
+
+          MIME=$(file -b --mime-type rom_dl/rom_archive)
+          echo ":: Detected MIME type: $MIME"
+
+          case "$MIME" in
+            application/gzip|application/x-gzip)
+              echo ":: Extracting .tar.gz / .tgz..."
+              tar -xzf rom_dl/rom_archive -C out/images/
+              ;;
+            application/zip)
+              echo ":: Extracting .zip..."
+              unzip -o rom_dl/rom_archive -d out/images/
+              ;;
+            application/x-bzip2)
+              echo ":: Extracting .tar.bz2..."
+              tar -xjf rom_dl/rom_archive -C out/images/
+              ;;
+            application/x-xz)
+              echo ":: Extracting .tar.xz..."
+              tar -xJf rom_dl/rom_archive -C out/images/
+              ;;
+            *)
+              echo ":: Unknown type, trying generic tar then unzip..."
+              tar -xf rom_dl/rom_archive -C out/images/ 2>/dev/null \
+                || unzip -o rom_dl/rom_archive -d out/images/
+              ;;
+          esac
+
+          rm -rf rom_dl/
+
+          echo ":: Flattening directory structure..."
+          # Move all .img files to out/images/ root
+          find out/images/ -mindepth 2 -name "*.img" -exec mv {} out/images/ \;
+          # Remove empty subdirectories and non-image files
+          find out/images/ -mindepth 1 -not -name "*.img" -not -type d -delete
+          find out/images/ -mindepth 1 -type d -empty -delete
+
+          echo ""
+          echo ":: Images found:"
+          ls -lh out/images/*.img 2>/dev/null || { echo "ERROR: No .img files found"; exit 1; }
+          df -h /
+
+      # ── 6. Convert sparse → raw (fastboot only, optional) ─────────────────
+      - name: "[Fastboot] Convert sparse images to raw"
+        if: inputs.rom_type == 'fastboot' && inputs.convert_sparse == 'true'
+        run: |
+          echo ":: Converting sparse images to raw format..."
+          COUNT_OK=0
+          COUNT_SKIP=0
+
+          for img in out/images/*.img; do
+            NAME=$(basename "$img")
+            if simg2img "$img" "${img}.raw" 2>/dev/null; then
+              echo "  ✓ converted : $NAME"
+              rm "$img"
+              mv "${img}.raw" "$img"
+              COUNT_OK=$((COUNT_OK + 1))
+            else
+              echo "  ~ already raw: $NAME"
+              rm -f "${img}.raw"
+              COUNT_SKIP=$((COUNT_SKIP + 1))
+            fi
+          done
+
+          echo ""
+          echo ":: Results → converted: $COUNT_OK  |  already raw: $COUNT_SKIP"
+          df -h /
+
+      # ── 7. Compress with xz (optional) ────────────────────────────────────
+      - name: "Compress images with xz"
+        if: inputs.compress_images == 'true'
+        run: |
+          echo ":: Compressing images (xz -T0 -6)..."
+          for img in out/images/*.img; do
+            echo "  compressing $(basename $img)..."
+            xz -T0 -6 "$img"
+            echo "  ✓ $(basename $img).xz  →  $(du -h "${img}.xz" | cut -f1)"
+          done
+          df -h /
+
+      # ── 8. Generate checksums + release notes ─────────────────────────────
+      - name: Generate checksums and release body
+        run: |
+          cd out/images
+
+          echo ":: Generating SHA256SUMS..."
+          sha256sum * | sort > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+          echo ""
+          echo ":: Building release notes..."
+
+          python3 - << 'PYEOF'
+          import os, subprocess
+
+          image_dir = "."
+          files = sorted(f for f in os.listdir(image_dir) if f != "SHA256SUMS.txt")
+
+          rows = []
+          for f in files:
+              size = subprocess.check_output(["du", "-h", f]).decode().split()[0]
+              rows.append(f"| `{f}` | {size} |")
+
+          import datetime
+          now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+          body = f"""## HyperOS ROM Dump
+
+          | Key | Value |
+          |-----|-------|
+          | **Device** | ${{ inputs.device_name }} |
+          | **ROM Type** | ${{ inputs.rom_type }} |
+          | **Tag** | ${{ inputs.release_tag }} |
+          | **Dumped at** | {now} |
+          | **Workflow** | [View run](${{{{ github.server_url }}}}/{os.environ.get('GITHUB_REPOSITORY','')}/actions/runs/${{{{ github.run_id }}}}) |
+
+          ### Partition Images
+
+          | File | Size |
+          |------|------|
+          {chr(10).join(rows)}
+
+          ### Source ROM
+          ```
+          ${{ inputs.rom_url }}
+          ```
+
+          > ⚙️ Dumped automatically via [HyperOS ROM Dumper](../../actions/workflows/dump-rom.yml)
+          """
+
+          # Clean up indentation from heredoc
+          lines = body.split("\n")
+          cleaned = "\n".join(l[10:] if l.startswith("          ") else l for l in lines)
+
+          with open("/tmp/release_body.md", "w") as f:
+              f.write(cleaned)
+
+          print("Release body written.")
+          PYEOF
+
+      # ── 9. Upload to GitHub Releases ──────────────────────────────────────
+      - name: Upload to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: "[${{ inputs.device_name }}] HyperOS ${{ inputs.rom_type }} dump — ${{ inputs.release_tag }}"
+          body_path: /tmp/release_body.md
+          files: out/images/*
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fail_on_unmatched_files: false
+          make_latest: false
+
+      # ── 10. Summary ────────────────────────────────────────────────────────
+      - name: Job summary
+        if: always()
+        run: |
+          echo "## ✅ ROM Dump Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| | |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Device** | ${{ inputs.device_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **ROM Type** | ${{ inputs.rom_type }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Release tag** | \`${{ inputs.release_tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -d out/images ]; then
+            echo "### Files uploaded" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            ls -lh out/images/ >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          fi
