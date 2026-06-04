@@ -1,4 +1,4 @@
-name: HyperOS ROM Dumper (DumprX -> Repo)
+name: HyperOS ROM Dumper (DumprX -> Branch)
 
 on:
   workflow_dispatch:
@@ -7,15 +7,27 @@ on:
         description: "Direct ROM URL (will be used exactly as entered)"
         required: true
         type: string
-      release_tag:
-        description: "Folder name for this dump"
+      target_branch:
+        description: "Branch to push dump files (NOT main)"
         required: true
+        default: "dumps"
         type: string
       device_name:
         description: "Device codename override (optional)"
         required: false
         default: "unknown"
         type: string
+      max_connections:
+        description: "Download connections (8-32). Higher can help on fast mirrors"
+        required: false
+        default: "16"
+        type: choice
+        options:
+          - "8"
+          - "12"
+          - "16"
+          - "24"
+          - "32"
       extract_contents:
         description: "Extract mounted filesystem contents when possible"
         required: false
@@ -85,24 +97,50 @@ jobs:
           echo ":: Using EXACT user URL"
           echo "$URL"
 
+      - name: Download ROM (optimized, exact URL only)
+        run: |
+          set -e
+          mkdir -p /tmp/rom_dl
+          URL='${{ steps.validate.outputs.rom_url }}'
+          CONN='${{ inputs.max_connections }}'
+
+          aria2c \
+            --file-allocation=none \
+            --continue=true \
+            --allow-overwrite=true \
+            --min-split-size=4M \
+            --max-concurrent-downloads=1 \
+            --max-connection-per-server="$CONN" \
+            -x "$CONN" -s "$CONN" -k 4M \
+            --retry-wait=3 --max-tries=0 \
+            --connect-timeout=20 --timeout=30 \
+            --lowest-speed-limit=50K \
+            --console-log-level=warn \
+            --summary-interval=15 \
+            --dir=/tmp/rom_dl \
+            --out=rom_archive \
+            "$URL"
+
+          ls -lh /tmp/rom_dl/rom_archive
+
       - name: Clone DumprX toolkit
         run: |
           set -e
           rm -rf /tmp/DumprX
           git clone --depth=1 https://github.com/DumprX/DumprX.git /tmp/DumprX
 
-      - name: Run DumprX with provided URL
+      - name: Run DumprX with downloaded file (no self-downloading URL)
         run: |
           set -e
           cd /tmp/DumprX
           chmod +x dumper.sh setup.sh
-          # DumprX reads the URL argument directly. No internal hardcoded ROM URL is passed from this workflow.
-          ./dumper.sh '${{ steps.validate.outputs.rom_url }}'
+          # Pass local file path so DumprX does not fetch any other link by itself.
+          ./dumper.sh '/tmp/rom_dl/rom_archive'
 
       - name: Collect output files
         run: |
           set -e
-          DUMP_ROOT="rom_dumps/${{ inputs.release_tag }}"
+          DUMP_ROOT="/tmp/final_dump"
           mkdir -p "$DUMP_ROOT"
 
           if [ ! -d /tmp/DumprX/out ]; then
@@ -112,10 +150,10 @@ jobs:
 
           rsync -a /tmp/DumprX/out/ "$DUMP_ROOT/"
 
-          # Keep source URL and run metadata beside dump files.
+          # Keep source URL and run metadata at branch root.
           {
             echo "rom_url=${{ steps.validate.outputs.rom_url }}"
-            echo "release_tag=${{ inputs.release_tag }}"
+            echo "target_branch=${{ inputs.target_branch }}"
             echo "device_name_input=${{ inputs.device_name }}"
             echo "workflow_run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             echo "dumped_at=$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
@@ -125,7 +163,7 @@ jobs:
         if: inputs.compress_images == 'true'
         run: |
           set -e
-          DUMP_ROOT="rom_dumps/${{ inputs.release_tag }}"
+          DUMP_ROOT="/tmp/final_dump"
           find "$DUMP_ROOT" -type f -name '*.img' -print0 | while IFS= read -r -d '' img; do
             xz -T0 -6 "$img"
           done
@@ -134,7 +172,7 @@ jobs:
         if: inputs.extract_contents == 'true'
         run: |
           set -e
-          DUMP_ROOT="rom_dumps/${{ inputs.release_tag }}"
+          DUMP_ROOT="/tmp/final_dump"
           EXTRACT_ROOT="$DUMP_ROOT/extracted"
           mkdir -p "$EXTRACT_ROOT"
 
@@ -161,15 +199,30 @@ jobs:
             sudo chown -R "$USER:$USER" "$out" 2>/dev/null || true
           done
 
-      - name: Commit dump files to same repository
+      - name: Push all dump files to target branch root
         run: |
           set -e
+          BRANCH='${{ inputs.target_branch }}'
+          [ "$BRANCH" != "main" ] || { echo "ERROR: target_branch must not be main"; exit 1; }
+
           git lfs install
 
-          # Track large binary files with LFS before adding.
-          git lfs track "rom_dumps/**/*.img" "rom_dumps/**/*.img.xz" "rom_dumps/**/*.bin" "rom_dumps/**/*.new.dat" "rom_dumps/**/*.br"
+          git fetch origin
+          if git ls-remote --heads origin "$BRANCH" | grep -q "$BRANCH"; then
+            git checkout -B "$BRANCH" "origin/$BRANCH"
+          else
+            git checkout --orphan "$BRANCH"
+          fi
 
-          git add .gitattributes rom_dumps/${{ inputs.release_tag }}
+          # Clean branch root so new dump is directly at root, not inside folders.
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+
+          # Track large binary files with LFS before adding.
+          git lfs track "*.img" "*.img.xz" "*.bin" "*.new.dat" "*.br" "*.dat" "*.payload"
+
+          rsync -a /tmp/final_dump/ ./
+
+          git add .gitattributes .
 
           if git diff --cached --quiet; then
             echo "No file changes to commit"
@@ -178,8 +231,8 @@ jobs:
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "dump: ${{ inputs.release_tag }}"
-          git push origin "${{ github.ref_name }}"
+          git commit -m "dump: ${{ inputs.device_name }} from user URL"
+          git push -f origin "$BRANCH"
 
       - name: Job summary
         if: always()
@@ -188,14 +241,14 @@ jobs:
             echo "## DumprX Dump Complete"
             echo
             echo "- URL used exactly: \`${{ steps.validate.outputs.rom_url }}\`"
-            echo "- Commit branch: \`${{ github.ref_name }}\`"
-            echo "- Dump folder: \`rom_dumps/${{ inputs.release_tag }}\`"
+            echo "- Commit branch: \`${{ inputs.target_branch }}\`"
+            echo "- Files pushed at branch root: \`yes\`"
             echo "- Release upload: disabled"
             echo
-            if [ -d "rom_dumps/${{ inputs.release_tag }}" ]; then
+            if [ -d "/tmp/final_dump" ]; then
               echo "### Files"
               echo '```'
-              ls -lah "rom_dumps/${{ inputs.release_tag }}" | sed -n '1,200p'
+              ls -lah /tmp/final_dump | sed -n '1,200p'
               echo '```'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
