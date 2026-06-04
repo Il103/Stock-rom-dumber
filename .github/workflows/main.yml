@@ -1,69 +1,37 @@
-name: HyperOS ROM Dumper (Smart)
+name: HyperOS ROM Dumper (DumprX -> Repo)
 
 on:
   workflow_dispatch:
     inputs:
-      rom_type:
-        description: "ROM type (auto/recovery/fastboot)"
-        required: true
-        default: "auto"
-        type: choice
-        options:
-          - auto
-          - recovery
-          - fastboot
-
       rom_url:
-        description: "Direct ROM download URL"
+        description: "Direct ROM URL (will be used exactly as entered)"
         required: true
         type: string
-
       release_tag:
-        description: "Release tag (example: HyperOS-spinel-V816.0.4.0.UNACNXM)"
+        description: "Folder name for this dump"
         required: true
         type: string
-
       device_name:
         description: "Device codename override (optional)"
         required: false
         default: "unknown"
         type: string
-
-      convert_sparse:
-        description: "Convert sparse -> raw images (fastboot only)"
+      extract_contents:
+        description: "Extract mounted filesystem contents when possible"
         required: false
         default: "true"
         type: choice
         options:
           - "true"
           - "false"
-
       compress_images:
-        description: "Compress images using xz"
+        description: "Compress *.img with xz before commit"
         required: false
         default: "false"
         type: choice
         options:
           - "false"
           - "true"
-
-      extract_contents:
-        description: "Mount images and extract filesystem contents"
-        required: false
-        default: "true"
-        type: choice
-        options:
-          - "true"
-          - "false"
-
-      upload_original:
-        description: "Upload original ROM archive"
-        required: false
-        default: "true"
-        type: choice
-        options:
-          - "true"
-          - "false"
 
 jobs:
   dump-rom:
@@ -72,438 +40,162 @@ jobs:
       contents: write
 
     steps:
-      - name: Checkout repository
+      - name: Checkout current repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
 
-      - name: Free disk space
+      - name: Prepare workspace and free disk
         run: |
           set -e
-          echo ":: Disk before cleanup"
+          echo ":: Disk before"
           df -h /
-
-          sudo rm -rf \
-            /usr/share/dotnet \
-            /usr/local/lib/android \
-            /opt/ghc \
-            /opt/hostedtoolcache/CodeQL \
-            /usr/share/swift \
-            /usr/local/.ghcup \
-            "$AGENT_TOOLSDIRECTORY"
-
-          sudo docker image prune --all --force 2>/dev/null || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
           sudo apt-get clean -qq || true
-
-          echo ":: Disk after cleanup"
+          sudo docker image prune --all --force 2>/dev/null || true
+          echo ":: Disk after"
           df -h /
 
-      - name: Install dependencies
+      - name: Install dependencies for DumprX
         run: |
           set -e
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            aria2 unzip tar python3 xz-utils file curl jq \
-            android-sdk-libsparse-utils \
-            e2fsprogs e2tools erofs-utils \
-            util-linux rsync
+            git curl jq aria2 file rsync unzip tar zip \
+            python3 python3-pip xz-utils \
+            p7zip-full unrar sharutils cabextract \
+            brotli liblz4-tool gawk detox cpio rename \
+            android-sdk-libsparse-utils e2fsprogs e2tools erofs-utils \
+            git-lfs
 
-      - name: Install payload-dumper-go
+          if ! command -v uv >/dev/null 2>&1; then
+            curl -fsSL https://astral.sh/uv/install.sh | sh
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Validate input URL (no auto/fallback links)
+        id: validate
         run: |
           set -e
-          echo ":: Fetching latest payload-dumper-go release"
-          ASSET_URL=$(curl -fsSL https://api.github.com/repos/ssut/payload-dumper-go/releases/latest | jq -r '.assets[] | select(.name|test("linux.*amd64")) | .browser_download_url' | head -n1)
+          URL='${{ inputs.rom_url }}'
+          [ -n "$URL" ] || { echo "ERROR: rom_url is empty"; exit 1; }
+          echo "$URL" | grep -qE '^https?://' || { echo "ERROR: rom_url must start with http/https"; exit 1; }
+          echo "rom_url=$URL" >> "$GITHUB_OUTPUT"
+          echo ":: Using EXACT user URL"
+          echo "$URL"
 
-          if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
-            echo "ERROR: Could not locate linux/amd64 payload-dumper-go binary"
+      - name: Clone DumprX toolkit
+        run: |
+          set -e
+          rm -rf /tmp/DumprX
+          git clone --depth=1 https://github.com/DumprX/DumprX.git /tmp/DumprX
+
+      - name: Run DumprX with provided URL
+        run: |
+          set -e
+          cd /tmp/DumprX
+          chmod +x dumper.sh setup.sh
+          # DumprX reads the URL argument directly. No internal hardcoded ROM URL is passed from this workflow.
+          ./dumper.sh '${{ steps.validate.outputs.rom_url }}'
+
+      - name: Collect output files
+        run: |
+          set -e
+          DUMP_ROOT="rom_dumps/${{ inputs.release_tag }}"
+          mkdir -p "$DUMP_ROOT"
+
+          if [ ! -d /tmp/DumprX/out ]; then
+            echo "ERROR: DumprX did not produce /tmp/DumprX/out"
             exit 1
           fi
 
-          wget -q "$ASSET_URL" -O /tmp/pdg.tar.gz
-          tar -xzf /tmp/pdg.tar.gz -C /tmp/
-          chmod +x /tmp/payload-dumper-go
-          sudo mv /tmp/payload-dumper-go /usr/local/bin/payload-dumper-go
-          payload-dumper-go --version || true
+          rsync -a /tmp/DumprX/out/ "$DUMP_ROOT/"
 
-      - name: Download ROM archive
-        run: |
-          set -e
-          mkdir -p rom_dl
-          echo ":: URL: ${{ inputs.rom_url }}"
+          # Keep source URL and run metadata beside dump files.
+          {
+            echo "rom_url=${{ steps.validate.outputs.rom_url }}"
+            echo "release_tag=${{ inputs.release_tag }}"
+            echo "device_name_input=${{ inputs.device_name }}"
+            echo "workflow_run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "dumped_at=$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          } > "$DUMP_ROOT/_dump_info.txt"
 
-          aria2c \
-            --file-allocation=none \
-            -x 16 -s 16 -k 4M \
-            --retry-wait=5 --max-tries=5 \
-            --console-log-level=warn \
-            --summary-interval=30 \
-            --dir=rom_dl \
-            --out=rom_archive \
-            "${{ inputs.rom_url }}"
-
-          ls -lh rom_dl/rom_archive
-
-      - name: Detect ROM type (smart)
-        id: mode
-        run: |
-          set -e
-          INPUT_TYPE="${{ inputs.rom_type }}"
-
-          detect_from_archive() {
-            local archive="$1"
-            local mime
-            mime=$(file -b --mime-type "$archive")
-
-            if [ "$mime" = "application/gzip" ] || [ "$mime" = "application/x-gzip" ]; then
-              echo "fastboot"
-              return
-            fi
-
-            if [ "$mime" = "application/zip" ]; then
-              if unzip -l "$archive" 2>/dev/null | grep -qi "payload\.bin"; then
-                echo "recovery"
-              else
-                echo "fastboot"
-              fi
-              return
-            fi
-
-            if tar -tf "$archive" 2>/dev/null | grep -qiE "(^|/)images/.+\.img$|\.img$"; then
-              echo "fastboot"
-              return
-            fi
-
-            echo "unknown"
-          }
-
-          if [ "$INPUT_TYPE" != "auto" ]; then
-            ROM_TYPE="$INPUT_TYPE"
-          else
-            ROM_TYPE=$(detect_from_archive rom_dl/rom_archive)
-          fi
-
-          if [ "$ROM_TYPE" = "unknown" ]; then
-            echo "ERROR: Could not detect ROM type. Use rom_type override."
-            exit 1
-          fi
-
-          echo "Detected ROM type: $ROM_TYPE"
-          echo "rom_type=$ROM_TYPE" >> "$GITHUB_OUTPUT"
-
-      - name: Recovery -> extract payload.bin and dump images
-        if: steps.mode.outputs.rom_type == 'recovery'
-        run: |
-          set -e
-          mkdir -p out/images
-
-          PAYLOAD_ENTRY=$(unzip -l rom_dl/rom_archive | awk '{print $4}' | grep -i "payload\.bin" | head -n1)
-
-          if [ -z "$PAYLOAD_ENTRY" ]; then
-            echo "ERROR: payload.bin not found"
-            unzip -l rom_dl/rom_archive | tail -n 40
-            exit 1
-          fi
-
-          unzip -p rom_dl/rom_archive "$PAYLOAD_ENTRY" > /tmp/payload.bin
-          payload-dumper-go -output out/images /tmp/payload.bin
-          rm -f /tmp/payload.bin
-
-          if [ "${{ inputs.upload_original }}" = "true" ]; then
-            cp rom_dl/rom_archive out/rom_archive_original.zip
-          fi
-
-      - name: Fastboot -> extract archive and collect images
-        if: steps.mode.outputs.rom_type == 'fastboot'
-        run: |
-          set -e
-          mkdir -p out/images
-
-          MIME=$(file -b --mime-type rom_dl/rom_archive)
-          echo "Detected MIME: $MIME"
-
-          case "$MIME" in
-            application/gzip|application/x-gzip)
-              tar -xzf rom_dl/rom_archive -C out/images/
-              ;;
-            application/zip)
-              unzip -o rom_dl/rom_archive -d out/images/
-              ;;
-            application/x-bzip2)
-              tar -xjf rom_dl/rom_archive -C out/images/
-              ;;
-            application/x-xz)
-              tar -xJf rom_dl/rom_archive -C out/images/
-              ;;
-            *)
-              tar -xf rom_dl/rom_archive -C out/images/ 2>/dev/null || unzip -o rom_dl/rom_archive -d out/images/
-              ;;
-          esac
-
-          # Move all img files to out/images root and keep unique names.
-          while IFS= read -r -d '' img; do
-            base=$(basename "$img")
-            target="out/images/$base"
-            if [ -e "$target" ]; then
-              hash=$(sha1sum "$img" | cut -c1-8)
-              target="out/images/${base%.img}_$hash.img"
-            fi
-            mv "$img" "$target"
-          done < <(find out/images -type f -iname '*.img' -print0)
-
-          find out/images -mindepth 1 -type d -empty -delete
-
-          if [ "${{ inputs.upload_original }}" = "true" ]; then
-            cp rom_dl/rom_archive out/rom_archive_original
-          fi
-
-          ls -lh out/images/*.img 2>/dev/null || { echo "ERROR: no .img files found"; exit 1; }
-
-      - name: Convert sparse images to raw
-        if: steps.mode.outputs.rom_type == 'fastboot' && inputs.convert_sparse == 'true'
-        run: |
-          set -e
-          ok=0
-          skip=0
-
-          for img in out/images/*.img; do
-            [ -e "$img" ] || continue
-            if simg2img "$img" "${img}.raw" 2>/dev/null; then
-              mv "${img}.raw" "$img"
-              ok=$((ok + 1))
-              echo "converted: $(basename "$img")"
-            else
-              rm -f "${img}.raw"
-              skip=$((skip + 1))
-            fi
-          done
-
-          echo "Converted: $ok | Already raw: $skip"
-
-      - name: Auto-extract device info from images
-        id: devinfo
-        run: |
-          set -e
-          mkdir -p /tmp/rom_mnt
-          rm -f /tmp/build.prop
-
-          try_extract_build_prop() {
-            local img="$1"
-
-            # ext4 path options via debugfs
-            debugfs -R "cat /build.prop" "$img" > /tmp/build.prop 2>/dev/null && [ -s /tmp/build.prop ] && return 0
-            debugfs -R "cat /system/build.prop" "$img" > /tmp/build.prop 2>/dev/null && [ -s /tmp/build.prop ] && return 0
-
-            # mount fallback for erofs/f2fs/ext4
-            local loop
-            loop=$(sudo losetup -f --show "$img" 2>/dev/null || true)
-            if [ -n "$loop" ]; then
-              if sudo mount -o ro "$loop" /tmp/rom_mnt 2>/dev/null; then
-                for bp in /tmp/rom_mnt/build.prop /tmp/rom_mnt/system/build.prop; do
-                  if [ -f "$bp" ]; then
-                    cp "$bp" /tmp/build.prop
-                    sudo umount /tmp/rom_mnt || true
-                    sudo losetup -d "$loop" || true
-                    return 0
-                  fi
-                done
-                sudo umount /tmp/rom_mnt || true
-              fi
-              sudo losetup -d "$loop" || true
-            fi
-
-            return 1
-          }
-
-          found=0
-          for part in system system_ext product vendor odm; do
-            candidate="out/images/${part}.img"
-            if [ -f "$candidate" ] && try_extract_build_prop "$candidate"; then
-              found=1
-              break
-            fi
-          done
-
-          if [ "$found" -eq 0 ]; then
-            # fallback: first image containing readable props strings
-            for candidate in out/images/*.img; do
-              [ -e "$candidate" ] || continue
-              strings "$candidate" | grep -E '^ro\.(product\.device|product\.model|product\.brand|build\.fingerprint|build\.version\.incremental|build\.version\.security_patch|mi\.os\.version\.name|miui\.ui\.version\.name)=' > /tmp/build.prop 2>/dev/null || true
-              if [ -s /tmp/build.prop ]; then
-                found=1
-                break
-              fi
-            done
-          fi
-
-          get_prop() {
-            local key="$1"
-            grep -m1 "^${key}=" /tmp/build.prop 2>/dev/null | cut -d= -f2-
-          }
-
-          CODENAME=$(get_prop ro.product.device)
-          MODEL=$(get_prop ro.product.model)
-          BRAND=$(get_prop ro.product.brand)
-          BUILD=$(get_prop ro.build.version.incremental)
-          PATCH=$(get_prop ro.build.version.security_patch)
-          FINGERPRINT=$(get_prop ro.build.fingerprint)
-          HYPEROS=$(get_prop ro.mi.os.version.name)
-
-          if [ -n "$CODENAME" ] && [ "$CODENAME" != "unknown" ]; then
-            FINAL_DEVICE="$CODENAME"
-          else
-            FINAL_DEVICE="${{ inputs.device_name }}"
-          fi
-
-          echo "device=$FINAL_DEVICE" >> "$GITHUB_OUTPUT"
-          echo "codename=$CODENAME" >> "$GITHUB_OUTPUT"
-          echo "model=$MODEL" >> "$GITHUB_OUTPUT"
-          echo "brand=$BRAND" >> "$GITHUB_OUTPUT"
-          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
-          echo "patch=$PATCH" >> "$GITHUB_OUTPUT"
-          echo "fingerprint=$FINGERPRINT" >> "$GITHUB_OUTPUT"
-          echo "hyperos=$HYPEROS" >> "$GITHUB_OUTPUT"
-
-      - name: Extract all image filesystems
-        if: inputs.extract_contents == 'true'
-        run: |
-          set -e
-          mkdir -p out/extracted
-
-          extract_one() {
-            local img="$1"
-            local name="$2"
-            local dest="out/extracted/$name"
-            mkdir -p "$dest"
-
-            # ext4 dump via debugfs
-            if debugfs -R "ls" "$img" >/dev/null 2>&1; then
-              if debugfs -R "rdump / $dest" "$img" >/dev/null 2>&1; then
-                echo "[OK] debugfs extracted $name"
-                return 0
-              fi
-            fi
-
-            # loopback mount fallback
-            local loop
-            loop=$(sudo losetup -f --show "$img" 2>/dev/null || true)
-            if [ -n "$loop" ]; then
-              local mnt="/tmp/mnt_$name"
-              mkdir -p "$mnt"
-              if sudo mount -o ro "$loop" "$mnt" 2>/dev/null; then
-                sudo rsync -a "$mnt/" "$dest/" || true
-                sudo umount "$mnt" || true
-                sudo losetup -d "$loop" || true
-                sudo chown -R "$USER":"$USER" "$dest" || true
-                echo "[OK] mounted and extracted $name"
-                return 0
-              fi
-              sudo losetup -d "$loop" || true
-            fi
-
-            rm -rf "$dest"
-            echo "[SKIP] cannot extract $name"
-            return 1
-          }
-
-          ok=0
-          for img in out/images/*.img; do
-            [ -e "$img" ] || continue
-            name=$(basename "$img" .img)
-            if extract_one "$img" "$name"; then
-              ok=$((ok + 1))
-            fi
-          done
-
-          echo "Extracted partitions: $ok"
-
-      - name: Compress images with xz
+      - name: Optional image compression
         if: inputs.compress_images == 'true'
         run: |
           set -e
-          for img in out/images/*.img; do
-            [ -e "$img" ] || continue
+          DUMP_ROOT="rom_dumps/${{ inputs.release_tag }}"
+          find "$DUMP_ROOT" -type f -name '*.img' -print0 | while IFS= read -r -d '' img; do
             xz -T0 -6 "$img"
           done
 
-      - name: Generate checksums and release body
+      - name: Optional filesystem extraction pass
+        if: inputs.extract_contents == 'true'
         run: |
           set -e
-          mkdir -p out
+          DUMP_ROOT="rom_dumps/${{ inputs.release_tag }}"
+          EXTRACT_ROOT="$DUMP_ROOT/extracted"
+          mkdir -p "$EXTRACT_ROOT"
 
-          if [ -d out/images ]; then
-            (cd out/images && sha256sum * 2>/dev/null | sort > SHA256SUMS.txt)
-            cp out/images/SHA256SUMS.txt out/SHA256SUMS.txt 2>/dev/null || true
+          find "$DUMP_ROOT" -maxdepth 2 -type f -name '*.img' -print0 | while IFS= read -r -d '' img; do
+            name=$(basename "$img" .img)
+            out="$EXTRACT_ROOT/$name"
+            mkdir -p "$out"
+
+            if debugfs -R "rdump / $out" "$img" >/dev/null 2>&1; then
+              continue
+            fi
+
+            loop=$(sudo losetup -f --show "$img" 2>/dev/null || true)
+            if [ -n "$loop" ]; then
+              mnt="/tmp/mnt_$name"
+              mkdir -p "$mnt"
+              if sudo mount -o ro "$loop" "$mnt" 2>/dev/null; then
+                sudo rsync -a "$mnt/" "$out/" || true
+                sudo umount "$mnt" 2>/dev/null || true
+              fi
+              sudo losetup -d "$loop" 2>/dev/null || true
+            fi
+
+            sudo chown -R "$USER:$USER" "$out" 2>/dev/null || true
+          done
+
+      - name: Commit dump files to same repository
+        run: |
+          set -e
+          git lfs install
+
+          # Track large binary files with LFS before adding.
+          git lfs track "rom_dumps/**/*.img" "rom_dumps/**/*.img.xz" "rom_dumps/**/*.bin" "rom_dumps/**/*.new.dat" "rom_dumps/**/*.br"
+
+          git add .gitattributes rom_dumps/${{ inputs.release_tag }}
+
+          if git diff --cached --quiet; then
+            echo "No file changes to commit"
+            exit 0
           fi
 
-          {
-            echo "## HyperOS ROM Dump"
-            echo
-            echo "| Key | Value |"
-            echo "|-----|-------|"
-            echo "| Device | ${{ steps.devinfo.outputs.device }} |"
-            echo "| ROM Type | ${{ steps.mode.outputs.rom_type }} |"
-            echo "| Release Tag | ${{ inputs.release_tag }} |"
-            echo "| Source URL | ${{ inputs.rom_url }} |"
-            echo
-
-            echo "### Auto Device Info"
-            echo
-            echo "| Property | Value |"
-            echo "|----------|-------|"
-            echo "| Brand | ${{ steps.devinfo.outputs.brand }} |"
-            echo "| Model | ${{ steps.devinfo.outputs.model }} |"
-            echo "| Codename | ${{ steps.devinfo.outputs.codename }} |"
-            echo "| Build | ${{ steps.devinfo.outputs.build }} |"
-            echo "| Security Patch | ${{ steps.devinfo.outputs.patch }} |"
-            echo "| HyperOS | ${{ steps.devinfo.outputs.hyperos }} |"
-            echo
-
-            echo "### Files"
-            echo
-            echo "| File | Size |"
-            echo "|------|------|"
-            for f in out/images/*; do
-              [ -f "$f" ] || continue
-              echo "| \`$(basename "$f")\` | $(du -h "$f" | cut -f1) |"
-            done
-
-            if [ -d out/extracted ]; then
-              echo
-              echo "### Extracted Filesystems"
-              echo
-              find out/extracted -mindepth 1 -maxdepth 1 -type d -printf "- %f\n"
-            fi
-          } > /tmp/release_body.md
-
-      - name: Upload to GitHub Releases
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ inputs.release_tag }}
-          name: "[${{ steps.devinfo.outputs.device }}] HyperOS ${{ steps.mode.outputs.rom_type }} dump - ${{ inputs.release_tag }}"
-          body_path: /tmp/release_body.md
-          files: |
-            out/images/*
-            out/SHA256SUMS.txt
-            out/rom_archive_original*
-            out/extracted/**
-          token: ${{ secrets.GITHUB_TOKEN }}
-          fail_on_unmatched_files: false
-          make_latest: false
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "dump: ${{ inputs.release_tag }}"
+          git push origin "${{ github.ref_name }}"
 
       - name: Job summary
         if: always()
         run: |
           {
-            echo "## ROM Dump Complete"
+            echo "## DumprX Dump Complete"
             echo
-            echo "| Key | Value |"
-            echo "|-----|-------|"
-            echo "| Device | ${{ steps.devinfo.outputs.device }} |"
-            echo "| ROM Type | ${{ steps.mode.outputs.rom_type }} |"
-            echo "| Release Tag | ${{ inputs.release_tag }} |"
+            echo "- URL used exactly: \`${{ steps.validate.outputs.rom_url }}\`"
+            echo "- Commit branch: \`${{ github.ref_name }}\`"
+            echo "- Dump folder: \`rom_dumps/${{ inputs.release_tag }}\`"
+            echo "- Release upload: disabled"
             echo
-            echo "### Uploaded files"
-            if [ -d out/images ]; then
-              ls -lh out/images
-            else
-              echo "No images directory found"
+            if [ -d "rom_dumps/${{ inputs.release_tag }}" ]; then
+              echo "### Files"
+              echo '```'
+              ls -lah "rom_dumps/${{ inputs.release_tag }}" | sed -n '1,200p'
+              echo '```'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
