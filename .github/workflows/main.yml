@@ -8,9 +8,9 @@ on:
         required: true
         type: string
       target_branch:
-        description: "Branch to push dump files (NOT main)"
-        required: true
-        default: "dumps"
+        description: "Branch to push dump files (set auto to generate from ROM info)"
+        required: false
+        default: "auto"
         type: string
       device_name:
         description: "Device codename override (optional)"
@@ -153,11 +153,46 @@ jobs:
           # Keep source URL and run metadata at branch root.
           {
             echo "rom_url=${{ steps.validate.outputs.rom_url }}"
-            echo "target_branch=${{ inputs.target_branch }}"
+            echo "target_branch_input=${{ inputs.target_branch }}"
             echo "device_name_input=${{ inputs.device_name }}"
             echo "workflow_run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             echo "dumped_at=$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           } > "$DUMP_ROOT/_dump_info.txt"
+
+      - name: Resolve target branch name
+        id: branch
+        run: |
+          set -e
+          INPUT_BRANCH='${{ inputs.target_branch }}'
+
+          sanitize() {
+            echo "$1" \
+              | tr '[:upper:]' '[:lower:]' \
+              | sed -E 's/[^a-z0-9._-]+/-/g; s/-+/-/g; s/^-+//; s/-+$//'
+          }
+
+          if [ -n "$INPUT_BRANCH" ] && [ "$INPUT_BRANCH" != "auto" ]; then
+            BRANCH=$(sanitize "$INPUT_BRANCH")
+          else
+            README="/tmp/final_dump/README.md"
+            BRAND=$(awk -F': ' '/^- Brand:/{print $2; exit}' "$README" 2>/dev/null || true)
+            CODENAME=$(awk -F': ' '/^- Codename:/{print $2; exit}' "$README" 2>/dev/null || true)
+            INCREMENTAL=$(awk -F': ' '/^- Incremental:/{print $2; exit}' "$README" 2>/dev/null || true)
+
+            [ -n "$CODENAME" ] || CODENAME='${{ inputs.device_name }}'
+            [ -n "$BRAND" ] || BRAND='stock'
+
+            RAW="dump-${BRAND}-${CODENAME}-${INCREMENTAL}"
+            BRANCH=$(sanitize "$RAW")
+          fi
+
+          [ -n "$BRANCH" ] || BRANCH="dumps-$(date +%Y%m%d-%H%M%S)"
+          [ "$BRANCH" != "main" ] || BRANCH="dumps-$(date +%Y%m%d-%H%M%S)"
+
+          echo "target_branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "Resolved target branch: $BRANCH"
+
+          echo "target_branch_resolved=$BRANCH" >> /tmp/final_dump/_dump_info.txt
 
       - name: Optional image compression
         if: inputs.compress_images == 'true'
@@ -202,8 +237,9 @@ jobs:
       - name: Push all dump files to target branch root
         run: |
           set -e
-          BRANCH='${{ inputs.target_branch }}'
-          [ "$BRANCH" != "main" ] || { echo "ERROR: target_branch must not be main"; exit 1; }
+          BRANCH='${{ steps.branch.outputs.target_branch }}'
+          [ -n "$BRANCH" ] || { echo "ERROR: resolved branch is empty"; exit 1; }
+          [ "$BRANCH" != "main" ] || { echo "ERROR: target branch cannot be main"; exit 1; }
 
           git lfs install
 
@@ -241,7 +277,7 @@ jobs:
             echo "## DumprX Dump Complete"
             echo
             echo "- URL used exactly: \`${{ steps.validate.outputs.rom_url }}\`"
-            echo "- Commit branch: \`${{ inputs.target_branch }}\`"
+            echo "- Commit branch: \`${{ steps.branch.outputs.target_branch }}\`"
             echo "- Files pushed at branch root: \`yes\`"
             echo "- Release upload: disabled"
             echo
