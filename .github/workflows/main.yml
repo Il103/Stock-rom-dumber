@@ -17,17 +17,6 @@ on:
         required: false
         default: "unknown"
         type: string
-      max_connections:
-        description: "Download connections (8-32). Higher can help on fast mirrors"
-        required: false
-        default: "16"
-        type: choice
-        options:
-          - "8"
-          - "12"
-          - "16"
-          - "24"
-          - "32"
       extract_contents:
         description: "Extract mounted filesystem contents when possible"
         required: false
@@ -97,45 +86,33 @@ jobs:
           echo ":: Using EXACT user URL"
           echo "$URL"
 
-      - name: Download ROM (optimized, exact URL only)
-        run: |
-          set -e
-          mkdir -p /tmp/rom_dl
-          URL='${{ steps.validate.outputs.rom_url }}'
-          CONN='${{ inputs.max_connections }}'
-
-          aria2c \
-            --file-allocation=none \
-            --continue=true \
-            --allow-overwrite=true \
-            --min-split-size=4M \
-            --max-concurrent-downloads=1 \
-            --max-connection-per-server="$CONN" \
-            -x "$CONN" -s "$CONN" -k 4M \
-            --retry-wait=3 --max-tries=0 \
-            --connect-timeout=20 --timeout=30 \
-            --lowest-speed-limit=50K \
-            --console-log-level=warn \
-            --summary-interval=15 \
-            --dir=/tmp/rom_dl \
-            --out=rom_archive \
-            "$URL"
-
-          ls -lh /tmp/rom_dl/rom_archive
-
       - name: Clone DumprX toolkit
         run: |
           set -e
           rm -rf /tmp/DumprX
           git clone --depth=1 https://github.com/DumprX/DumprX.git /tmp/DumprX
 
-      - name: Run DumprX with downloaded file (no self-downloading URL)
+      - name: Run DumprX with exact user URL
         run: |
-          set -e
+          set +e
           cd /tmp/DumprX
           chmod +x dumper.sh setup.sh
-          # Pass local file path so DumprX does not fetch any other link by itself.
-          ./dumper.sh '/tmp/rom_dl/rom_archive'
+          export TERM=xterm
+
+          # User requested DumprX to handle the URL directly.
+          ./dumper.sh '${{ steps.validate.outputs.rom_url }}'
+          DUMP_EXIT=$?
+
+          # DumprX may exit non-zero for metadata/push checks even when files were dumped.
+          if [ "$DUMP_EXIT" -ne 0 ]; then
+            echo ":: DumprX exited with code $DUMP_EXIT"
+            if [ -d /tmp/DumprX/out ] && [ -n "$(find /tmp/DumprX/out -type f | head -n1)" ]; then
+              echo ":: Continuing because dump files exist in /tmp/DumprX/out"
+            else
+              echo "ERROR: DumprX failed and produced no output files"
+              exit "$DUMP_EXIT"
+            fi
+          fi
 
       - name: Collect output files
         run: |
