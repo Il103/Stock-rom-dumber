@@ -71,9 +71,3 @@ After completion, go to **Branches** and switch to the newly created branch. All
 ---
 
 ---
-
-## النسخة العربية
-
-# Stock ROM Dumber
-
-> أداة **ذكية** تعمل على GitHub Actions تستخدم **DumprX** لاستخراج الرومات الأصلية (Stock ROMs) لأجهزة Xiaomi / HyperOS / MIUI / Redmi بشكل أوت
