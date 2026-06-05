@@ -20,7 +20,7 @@
 
 ## How to Use
 
-### 1. Fork this 
+### 1. Fork this repository
 ### 2. Run the Workflow
 Go to: **Actions → Stock ROM Dumber → Run workflow**
 
