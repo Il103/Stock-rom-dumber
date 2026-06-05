@@ -240,6 +240,9 @@ jobs:
           [ "$BRANCH" != "main" ] || { echo "ERROR: target branch cannot be main"; exit 1; }
 
           git lfs install
+          git config --global http.version HTTP/1.1
+          git config --global http.postBuffer 1048576000
+          git config --global core.compression 0
 
           git fetch origin
           if git ls-remote --heads origin "$BRANCH" | grep -q "$BRANCH"; then
@@ -256,17 +259,60 @@ jobs:
 
           rsync -a /tmp/final_dump/ ./
 
-          git add .gitattributes .
-
-          if git diff --cached --quiet; then
-            echo "No file changes to commit"
-            exit 0
-          fi
-
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "dump: ${{ inputs.device_name }} from user URL"
-          git push -f origin "$BRANCH"
+
+          push_retry() {
+            local tries=5
+            local i=1
+            local local_sha
+            local remote_sha
+            local_sha=$(git rev-parse HEAD)
+
+            while [ "$i" -le "$tries" ]; do
+              if git push -f origin "$BRANCH"; then
+                return 0
+              fi
+
+              remote_sha=$(git ls-remote origin "refs/heads/$BRANCH" | awk '{print $1}')
+              if [ -n "$remote_sha" ] && [ "$remote_sha" = "$local_sha" ]; then
+                echo "Remote already has the latest commit"
+                return 0
+              fi
+
+              echo "Push failed (attempt $i/$tries). Retrying in 15s..."
+              sleep 15
+              i=$((i + 1))
+            done
+
+            return 1
+          }
+
+          # Commit in chunks (top-level paths) to reduce push payload and avoid HTTP 500.
+          if [ -f .gitattributes ]; then
+            git add .gitattributes
+            if ! git diff --cached --quiet; then
+              git commit -m "dump: lfs attributes"
+              push_retry
+            fi
+          fi
+
+          for path in *; do
+            [ -e "$path" ] || continue
+            git add "$path"
+            if git diff --cached --quiet; then
+              continue
+            fi
+            git commit -m "dump: add $path"
+            push_retry
+          done
+
+          # Fallback final add if anything left unstaged.
+          git add .
+          if ! git diff --cached --quiet; then
+            git commit -m "dump: finalize"
+            push_retry
+          fi
 
       - name: Job summary
         if: always()
