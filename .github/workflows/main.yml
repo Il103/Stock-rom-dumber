@@ -255,9 +255,16 @@ jobs:
           find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
 
           # Track large binary files with LFS before adding.
-          git lfs track "*.img" "*.img.xz" "*.bin" "*.new.dat" "*.br" "*.dat" "*.payload"
+          git lfs track "*.img" "*.img.xz" "*.bin" "*.new.dat" "*.br" "*.dat" "*.payload" "*.apk" "*.apex" "*.jar" "*.zip" "*.so" "*.ko"
 
           rsync -a /tmp/final_dump/ ./
+
+          # Safety net: any file bigger than 95MB is forced into LFS by exact path.
+          while IFS= read -r -d '' f; do
+            git lfs track "$f"
+          done < <(find . -type f -size +95M -print0)
+
+          git add .gitattributes
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
