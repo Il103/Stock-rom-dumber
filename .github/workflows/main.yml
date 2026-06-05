@@ -67,6 +67,7 @@ jobs:
             python3 python3-pip xz-utils \
             p7zip-full unrar sharutils cabextract \
             brotli liblz4-tool gawk detox cpio rename \
+            device-tree-compiler \
             android-sdk-libsparse-utils e2fsprogs e2tools erofs-utils \
             git-lfs
 
@@ -170,6 +171,26 @@ jobs:
           echo "Resolved target branch: $BRANCH"
 
           echo "target_branch_resolved=$BRANCH" >> /tmp/final_dump/_dump_info.txt
+
+      - name: Recovery fallback from vendor_boot
+        run: |
+          set -e
+          ROOT="/tmp/final_dump"
+
+          # Some A/B devices keep recovery ramdisk inside vendor_boot.
+          if ! find "$ROOT" -type f -iname 'recovery.img' | grep -q .; then
+            VB=$(find "$ROOT" -type f -iname 'vendor_boot*.img' | head -n1 || true)
+            if [ -n "$VB" ] && [ -f "$VB" ]; then
+              cp "$VB" "$ROOT/recovery_from_vendor_boot.img"
+              echo "recovery_fallback=vendor_boot" >> "$ROOT/_dump_info.txt"
+              echo "recovery_source_file=$(basename "$VB")" >> "$ROOT/_dump_info.txt"
+              echo ":: recovery.img not found, fallback created from vendor_boot"
+            else
+              echo ":: no recovery.img and no vendor_boot.img found"
+            fi
+          else
+            echo ":: recovery.img exists"
+          fi
 
       - name: Optional image compression
         if: inputs.compress_images == 'true'
