@@ -20,7 +20,8 @@
 
 ## How to Use
 
-### 1. Run the Workflow
+### 1. Fork this 
+### 2. Run the Workflow
 Go to: **Actions → Stock ROM Dumber → Run workflow**
 
 #### Inputs:
