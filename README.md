@@ -1,6 +1,6 @@
 # Stock ROM Dumber
 
-> An intelligent GitHub Actions tool that uses **DumprX** to automatically dump and organize Stock ROMs (Xiaomi / HyperOS / MIUI / Redmi) in a smart way.
+> An intelligent GitHub Actions tool that uses **DumprX** to automatically dump and organize Stock ROMs
 
 ---
 
