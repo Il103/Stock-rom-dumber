@@ -273,6 +273,7 @@ jobs:
           GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
           GITLAB_USERNAME: ${{ secrets.GITLAB_USERNAME }}
           GITLAB_REPO: ${{ secrets.GITLAB_REPO }}
+          GITLAB_PROJECT_PATH: ${{ secrets.GITLAB_PROJECT_PATH }}
           GITLAB_REPO_URL: ${{ secrets.GITLAB_REPO_URL }}
         run: |
           set -e
@@ -280,12 +281,26 @@ jobs:
           GL_TOKEN="${GITLAB_TOKEN:-}"
           GL_USER="${GITLAB_USERNAME:-}"
           GL_REPO="${GITLAB_REPO:-}"
+          GL_PROJECT_PATH="${GITLAB_PROJECT_PATH:-}"
           GL_REPO_URL="${GITLAB_REPO_URL:-}"
 
           [ -n "$GL_TOKEN" ] || { echo "ERROR: Missing secret GITLAB_TOKEN"; exit 1; }
 
+          # Guard against placeholder values like ${GL_USER} accidentally stored in Secrets.
+          for v in "$GL_USER" "$GL_REPO" "$GL_PROJECT_PATH" "$GL_REPO_URL"; do
+            case "$v" in
+              *'${'*|*'}'*|*'$%'* )
+                echo "ERROR: Found placeholder-like text in GitLab secrets."
+                echo "Set real values only, e.g. mkpromvp or mkpromvp/Stock_room_dumb"
+                exit 1
+                ;;
+            esac
+          done
+
           if [ -n "$GL_REPO_URL" ]; then
             REPO_URL="$GL_REPO_URL"
+          elif [ -n "$GL_PROJECT_PATH" ]; then
+            REPO_URL="https://gitlab.com/${GL_PROJECT_PATH}.git"
           else
             [ -n "$GL_USER" ] || { echo "ERROR: Missing secret GITLAB_USERNAME"; exit 1; }
             [ -n "$GL_REPO" ] || { echo "ERROR: Missing secret GITLAB_REPO"; exit 1; }
@@ -293,9 +308,19 @@ jobs:
           fi
 
           REPO_URL="${REPO_URL%/}"
+          REPO_URL="${REPO_URL// /}"
           case "$REPO_URL" in
             *.git) ;;
             *) REPO_URL="${REPO_URL}.git" ;;
+          esac
+
+          case "$REPO_URL" in
+            https://gitlab.com/*) ;;
+            *)
+              echo "ERROR: Invalid GitLab URL: $REPO_URL"
+              echo "Use: https://gitlab.com/<owner-or-group>/<repo>.git"
+              exit 1
+              ;;
           esac
 
           AUTH_REMOTE="${REPO_URL/https:\/\//https:\/\/oauth2:${GL_TOKEN}@}"
