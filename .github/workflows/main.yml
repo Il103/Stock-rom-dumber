@@ -31,12 +31,11 @@ on:
         options: ["false", "true"]
 
       upload_github_branch:
-        description: "Upload to this GitHub repo branch (smart branch)"
+        description: "Upload to this repo smart branch"
         required: false
         default: "true"
         type: choice
         options: ["true", "false"]
-
       upload_gitlab:
         description: "Upload to GitLab"
         required: false
@@ -92,8 +91,7 @@ jobs:
             python3 python3-pip xz-utils p7zip-full unrar sharutils cabextract \
             brotli liblz4-tool gawk detox cpio rename \
             device-tree-compiler \
-            android-sdk-libsparse-utils e2fsprogs e2tools erofs-utils \
-            awscli openssh-client
+            android-sdk-libsparse-utils e2fsprogs e2tools erofs-utils
 
           if ! command -v uv >/dev/null 2>&1; then
             curl -fsSL https://astral.sh/uv/install.sh | sh
@@ -226,7 +224,7 @@ jobs:
             sudo chown -R "$USER:$USER" "$out" 2>/dev/null || true
           done
 
-      - name: Push to target branch on GitHub (smart)
+      - name: Push to target branch (smart)
         if: inputs.upload_github_branch == 'true'
         run: |
           set -e
@@ -248,11 +246,9 @@ jobs:
             git checkout --orphan "$BRANCH"
           fi
 
-          # Branch root only.
           find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
           rsync -a /tmp/final_dump/ ./
 
-          # Skip oversized APKs and print skipped names.
           rm -f /tmp/skipped_apk_report.txt
           find . -type f -name '*.apk' -size +100M -print0 | while IFS= read -r -d '' apk; do
             echo "SKIPPED (>100MB APK): $apk" | tee -a /tmp/skipped_apk_report.txt
@@ -260,43 +256,35 @@ jobs:
           done
           [ -f /tmp/skipped_apk_report.txt ] && cat /tmp/skipped_apk_report.txt >> ./_dump_info.txt || true
 
-          # Track large files with LFS.
           find . -type f -size +50M ! -path './.git/*' -print0 | while IFS= read -r -d '' f; do
             ext="${f##*.}"
             git lfs track "*.$ext" 2>/dev/null || true
           done
 
-          # Generate SHA256 checksums.
           find . -maxdepth 3 -type f ! -path './.git/*' ! -name '*.sha256' -name '*.img' -print0 | while IFS= read -r -d '' f; do
             sha256sum "$f" > "$f.sha256" 2>/dev/null || true
           done
 
-          # Generate file list.
           find . -type f ! -path './.git/*' | sort > ./file_list.txt || true
 
           git add -A
           git diff --cached --quiet && { echo "Nothing to commit"; exit 0; }
           git commit -m "dump: $BRANCH [$(date -u '+%Y-%m-%d')]"
 
-          pushed=0
           for attempt in 1 2 3; do
-            if git push origin "$BRANCH"; then
-              pushed=1
-              break
-            fi
+            git push origin "$BRANCH" && break
             echo "Push attempt $attempt failed, retrying..."
             sleep 10
           done
-          [ "$pushed" -eq 1 ] || { echo "ERROR: GitHub push failed after retries"; exit 1; }
 
           echo "github_upload=success" >> /tmp/final_dump/_dump_info.txt
 
-      - name: Mark GitHub upload disabled
+      - name: GitHub upload disabled
         if: inputs.upload_github_branch == 'false'
         run: |
           set -e
           echo "github_upload=disabled" >> /tmp/final_dump/_dump_info.txt
-          echo "GitHub branch upload is disabled by input."
+          echo "Skipping GitHub branch upload by user choice."
 
       - name: Mirror to GitLab
         if: inputs.upload_gitlab == 'true'
@@ -311,7 +299,12 @@ jobs:
           [ -z "$GITLAB_REPO" ] && echo "GITLAB_REPO not set, skipping." && exit 0
 
           BRANCH='${{ steps.branch.outputs.target_branch }}'
-          REMOTE="https://${GITLAB_USERNAME}:${GITLAB_TOKEN}@gitlab.com/${GITLAB_USERNAME}/${GITLAB_REPO}.git"
+          if echo "$GITLAB_REPO" | grep -q '/'; then
+            REPO_PATH="$GITLAB_REPO"
+          else
+            REPO_PATH="$GITLAB_USERNAME/$GITLAB_REPO"
+          fi
+          REMOTE="https://${GITLAB_USERNAME}:${GITLAB_TOKEN}@gitlab.com/${REPO_PATH}.git"
 
           rm -rf /tmp/gl_push
           mkdir -p /tmp/gl_push
@@ -354,7 +347,12 @@ jobs:
           BRANCH='${{ steps.branch.outputs.target_branch }}'
           BASE_URL="${GITEA_URL:-https://codeberg.org}"
           BASE_HOST="${BASE_URL#*://}"
-          AUTH_REMOTE="https://${GITEA_USERNAME}:${GITEA_TOKEN}@${BASE_HOST}/${GITEA_USERNAME}/${GITEA_REPO}.git"
+          if echo "$GITEA_REPO" | grep -q '/'; then
+            REPO_PATH="$GITEA_REPO"
+          else
+            REPO_PATH="$GITEA_USERNAME/$GITEA_REPO"
+          fi
+          AUTH_REMOTE="https://${GITEA_USERNAME}:${GITEA_TOKEN}@${BASE_HOST}/${REPO_PATH}.git"
 
           rm -rf /tmp/gt_push
           mkdir -p /tmp/gt_push
@@ -429,6 +427,8 @@ jobs:
           [ -z "$R2_ENDPOINT" ] && echo "R2_ENDPOINT not set, skipping." && exit 0
 
           BRANCH='${{ steps.branch.outputs.target_branch }}'
+          python3 -m pip install --user --quiet awscli || true
+          export PATH="$HOME/.local/bin:$PATH"
 
           AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" \
           AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" \
