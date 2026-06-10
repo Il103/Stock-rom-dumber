@@ -151,13 +151,23 @@ jobs:
             exit 0
           fi
 
-          archive="$(find /tmp/DumprX/input -maxdepth 1 -type f \( -iname '*.rar' -o -iname '*.zip' -o -iname '*.7z' \) | head -n1 || true)"
+          archive="$(find /tmp/DumprX/input -maxdepth 1 -type f \( -iname '*.rar' -o -iname '*.zip' -o -iname '*.7z' -o -name 'download' \) | head -n1 || true)"
           if [ -z "$archive" ]; then
             echo "No archive found in /tmp/DumprX/input for fallback."
             exit 0
           fi
 
           echo "Fallback archive detected: $archive"
+          mime="$(file -b --mime-type "$archive" 2>/dev/null || echo unknown)"
+          echo "Detected mime type: $mime"
+
+          case "$mime" in
+            text/html|text/plain)
+              echo "Fallback skipped: downloaded file is not firmware archive (likely HTML page/link shortener)."
+              exit 0
+              ;;
+          esac
+
           rm -rf /tmp/manual_extract
           mkdir -p /tmp/manual_extract /tmp/DumprX/out
 
@@ -176,14 +186,13 @@ jobs:
             cp -f "$f" /tmp/DumprX/out/ 2>/dev/null || true
           done
 
-          # Keep metadata so branch resolver has context.
-          {
-            echo "# Manual fallback output"
-            echo "- Source archive: $(basename "$archive")"
-            echo "- Note: DumprX parser failed, raw extracted files copied."
-          } > /tmp/DumprX/out/README.md
-
-          if [ -n "$(find /tmp/DumprX/out -type f | head -n1)" ]; then
+          usable_count="$(find /tmp/DumprX/out -maxdepth 1 -type f \( -iname '*.img' -o -iname '*.bin' -o -iname '*.mbn' -o -iname 'payload.bin' -o -iname 'super.img*' \) | wc -l)"
+          if [ "$usable_count" -gt 0 ]; then
+            {
+              echo "# Manual fallback output"
+              echo "- Source archive: $(basename "$archive")"
+              echo "- Note: DumprX parser failed, raw extracted files copied."
+            } > /tmp/DumprX/out/README.md
             echo "Fallback extraction created output files."
           else
             echo "Fallback extraction found no usable partition files."
@@ -196,10 +205,10 @@ jobs:
           [ -d /tmp/DumprX/out ] || { echo "ERROR: /tmp/DumprX/out missing"; exit 1; }
           rsync -a /tmp/DumprX/out/ /tmp/final_dump/
 
-          # Fail fast if DumprX produced no real files.
-          find /tmp/final_dump -type f | grep -q . || {
-            echo "ERROR: DumprX produced no output files."
-            echo "Hint: The ROM URL may not be a direct downloadable link, or format is unsupported (.ofp/.rar variants)."
+          # Fail fast if no real partition payload was produced.
+          find /tmp/final_dump -type f \( -iname '*.img' -o -iname '*.bin' -o -iname '*.mbn' -o -iname 'payload.bin' -o -iname 'super.img*' \) | grep -q . || {
+            echo "ERROR: No usable partition files were produced."
+            echo "Hint: The ROM URL is likely not a direct firmware file (DumprX downloaded HTML/placeholder), or format is unsupported/encrypted."
             exit 1
           }
 
