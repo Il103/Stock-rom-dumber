@@ -1,4 +1,4 @@
-name: Stock ROM Dumper (DumprX -> Multi Upload)
+name:  Stock ROM Dumper (DumprX -> Multi Upload)
 
 on:
   workflow_dispatch:
@@ -86,12 +86,29 @@ jobs:
         run: |
           set -e
           sudo apt-get update -qq
+
+          # Required packages (must exist)
           sudo apt-get install -y --no-install-recommends \
             git git-lfs curl jq file rsync unzip tar zip \
-            python3 python3-pip xz-utils p7zip-full unrar sharutils cabextract \
+            python3 python3-pip xz-utils p7zip-full sharutils cabextract \
             brotli liblz4-tool gawk detox cpio rename \
-            device-tree-compiler \
-            android-sdk-libsparse-utils e2fsprogs e2tools erofs-utils
+            device-tree-compiler e2fsprogs
+
+          # Optional packages (install if available, do not fail workflow if missing)
+          optional_pkgs=(
+            unrar
+            android-sdk-libsparse-utils
+            e2tools
+            erofs-utils
+          )
+
+          for pkg in "${optional_pkgs[@]}"; do
+            if apt-cache show "$pkg" >/dev/null 2>&1; then
+              sudo apt-get install -y --no-install-recommends "$pkg" || true
+            else
+              echo "Optional package not available on this runner: $pkg"
+            fi
+          done
 
           if ! command -v uv >/dev/null 2>&1; then
             curl -fsSL https://astral.sh/uv/install.sh | sh
@@ -206,8 +223,10 @@ jobs:
             out=/tmp/final_dump/extracted/$name
             mkdir -p "$out"
 
-            if debugfs -R "rdump / $out" "$img" >/dev/null 2>&1; then
-              continue
+            if command -v debugfs >/dev/null 2>&1; then
+              if debugfs -R "rdump / $out" "$img" >/dev/null 2>&1; then
+                continue
+              fi
             fi
 
             loop=$(sudo losetup -f --show "$img" 2>/dev/null || true)
@@ -271,11 +290,16 @@ jobs:
           git diff --cached --quiet && { echo "Nothing to commit"; exit 0; }
           git commit -m "dump: $BRANCH [$(date -u '+%Y-%m-%d')]"
 
+          ok=0
           for attempt in 1 2 3; do
-            git push origin "$BRANCH" && break
+            if git push origin "$BRANCH"; then
+              ok=1
+              break
+            fi
             echo "Push attempt $attempt failed, retrying..."
             sleep 10
           done
+          [ "$ok" -eq 1 ] || { echo "ERROR: GitHub push failed after retries"; exit 1; }
 
           echo "github_upload=success" >> /tmp/final_dump/_dump_info.txt
 
@@ -298,20 +322,23 @@ jobs:
           [ -z "$GITLAB_USERNAME" ] && echo "GITLAB_USERNAME not set, skipping." && exit 0
           [ -z "$GITLAB_REPO" ] && echo "GITLAB_REPO not set, skipping." && exit 0
 
-          BRANCH='${{ steps.branch.outputs.target_branch }}'
+          USER_RAW="${GITLAB_USERNAME#@}"
           if echo "$GITLAB_REPO" | grep -q '/'; then
             REPO_PATH="$GITLAB_REPO"
           else
-            REPO_PATH="$GITLAB_USERNAME/$GITLAB_REPO"
+            REPO_PATH="$USER_RAW/$GITLAB_REPO"
           fi
-          REMOTE="https://${GITLAB_USERNAME}:${GITLAB_TOKEN}@gitlab.com/${REPO_PATH}.git"
+
+          ENC_USER=$(python3 -c "import urllib.parse,os; print(urllib.parse.quote(os.environ['USER_RAW'], safe=''))")
+          ENC_TOKEN=$(python3 -c "import urllib.parse,os; print(urllib.parse.quote(os.environ['GITLAB_TOKEN'], safe=''))")
+          REMOTE="https://${ENC_USER}:${ENC_TOKEN}@gitlab.com/${REPO_PATH}.git"
 
           rm -rf /tmp/gl_push
           mkdir -p /tmp/gl_push
           rsync -a /tmp/final_dump/ /tmp/gl_push/
           cd /tmp/gl_push
 
-          git init -b "$BRANCH"
+          git init -b "${{ steps.branch.outputs.target_branch }}"
           git config user.email "action@github.com"
           git config user.name "GitHub Action"
           git lfs install
@@ -322,9 +349,9 @@ jobs:
           done
 
           git add -A
-          git commit -m "dump: $BRANCH [auto]" || echo "Nothing to commit"
+          git commit -m "dump: ${{ steps.branch.outputs.target_branch }} [auto]" || echo "Nothing to commit"
           git remote add origin "$REMOTE"
-          git push --force origin "$BRANCH" || {
+          git push --force origin "${{ steps.branch.outputs.target_branch }}" || {
             echo "WARNING: GitLab push failed. Continuing."
             exit 0
           }
@@ -344,22 +371,27 @@ jobs:
           [ -z "$GITEA_USERNAME" ] && echo "GITEA_USERNAME not set, skipping." && exit 0
           [ -z "$GITEA_REPO" ] && echo "GITEA_REPO not set, skipping." && exit 0
 
-          BRANCH='${{ steps.branch.outputs.target_branch }}'
+          USER_RAW="${GITEA_USERNAME#@}"
           BASE_URL="${GITEA_URL:-https://codeberg.org}"
-          BASE_HOST="${BASE_URL#*://}"
+          BASE_URL="${BASE_URL%/}"
+
           if echo "$GITEA_REPO" | grep -q '/'; then
             REPO_PATH="$GITEA_REPO"
           else
-            REPO_PATH="$GITEA_USERNAME/$GITEA_REPO"
+            REPO_PATH="$USER_RAW/$GITEA_REPO"
           fi
-          AUTH_REMOTE="https://${GITEA_USERNAME}:${GITEA_TOKEN}@${BASE_HOST}/${REPO_PATH}.git"
+
+          BASE_HOST="${BASE_URL#*://}"
+          ENC_USER=$(python3 -c "import urllib.parse,os; print(urllib.parse.quote(os.environ['USER_RAW'], safe=''))")
+          ENC_TOKEN=$(python3 -c "import urllib.parse,os; print(urllib.parse.quote(os.environ['GITEA_TOKEN'], safe=''))")
+          AUTH_REMOTE="https://${ENC_USER}:${ENC_TOKEN}@${BASE_HOST}/${REPO_PATH}.git"
 
           rm -rf /tmp/gt_push
           mkdir -p /tmp/gt_push
           rsync -a /tmp/final_dump/ /tmp/gt_push/
           cd /tmp/gt_push
 
-          git init -b "$BRANCH"
+          git init -b "${{ steps.branch.outputs.target_branch }}"
           git config user.email "action@github.com"
           git config user.name "GitHub Action"
           git lfs install
@@ -370,9 +402,9 @@ jobs:
           done
 
           git add -A
-          git commit -m "dump: $BRANCH [auto]" || echo "Nothing to commit"
+          git commit -m "dump: ${{ steps.branch.outputs.target_branch }} [auto]" || echo "Nothing to commit"
           git remote add origin "$AUTH_REMOTE"
-          git push --force origin "$BRANCH" || {
+          git push --force origin "${{ steps.branch.outputs.target_branch }}" || {
             echo "WARNING: Gitea push failed. Continuing."
             exit 0
           }
@@ -390,6 +422,11 @@ jobs:
           [ -z "$SF_USER" ] && echo "SF_USER not set, skipping." && exit 0
           [ -z "$SF_PROJECT" ] && echo "SF_PROJECT not set, skipping." && exit 0
           [ -z "$SF_SSH_KEY" ] && echo "SF_SSH_KEY not set, skipping." && exit 0
+
+          if ! command -v ssh >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends openssh-client
+          fi
 
           BRANCH='${{ steps.branch.outputs.target_branch }}'
 
@@ -426,9 +463,13 @@ jobs:
           [ -z "$R2_BUCKET" ] && echo "R2_BUCKET not set, skipping." && exit 0
           [ -z "$R2_ENDPOINT" ] && echo "R2_ENDPOINT not set, skipping." && exit 0
 
+          if ! command -v aws >/dev/null 2>&1; then
+            python3 -m pip install --user --quiet awscli
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.local/bin:$PATH"
+          fi
+
           BRANCH='${{ steps.branch.outputs.target_branch }}'
-          python3 -m pip install --user --quiet awscli || true
-          export PATH="$HOME/.local/bin:$PATH"
 
           AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" \
           AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" \
