@@ -1,4 +1,4 @@
-name: HyperOS ROM Dumper (DumprX -> Branch)
+name: HyperOS ROM Dumper (DumprX -> Multi Upload)
 
 on:
   workflow_dispatch:
@@ -25,6 +25,30 @@ on:
         options: ["true", "false"]
       compress_images:
         description: "Compress .img to .img.xz before push"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+      upload_gitlab:
+        description: "Upload to GitLab"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+      upload_gitea:
+        description: "Upload to Gitea/Codeberg"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+      upload_sourceforge:
+        description: "Upload to SourceForge"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+      upload_r2:
+        description: "Upload to Cloudflare R2"
         required: false
         default: "false"
         type: choice
@@ -60,7 +84,8 @@ jobs:
             python3 python3-pip xz-utils p7zip-full unrar sharutils cabextract \
             brotli liblz4-tool gawk detox cpio rename \
             device-tree-compiler \
-            android-sdk-libsparse-utils e2fsprogs e2tools erofs-utils
+            android-sdk-libsparse-utils e2fsprogs e2tools erofs-utils \
+            awscli openssh-client
 
           if ! command -v uv >/dev/null 2>&1; then
             curl -fsSL https://astral.sh/uv/install.sh | sh
@@ -214,11 +239,11 @@ jobs:
             git checkout --orphan "$BRANCH"
           fi
 
-          # Clear branch root only
+          # Branch root only.
           find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
           rsync -a /tmp/final_dump/ ./
 
-          # Skip oversized APKs and log them
+          # Skip oversized APKs and print skipped names.
           rm -f /tmp/skipped_apk_report.txt
           find . -type f -name '*.apk' -size +100M -print0 | while IFS= read -r -d '' apk; do
             echo "SKIPPED (>100MB APK): $apk" | tee -a /tmp/skipped_apk_report.txt
@@ -226,28 +251,177 @@ jobs:
           done
           [ -f /tmp/skipped_apk_report.txt ] && cat /tmp/skipped_apk_report.txt >> ./_dump_info.txt || true
 
-          # Track large files with LFS
+          # Track large files with LFS.
           find . -type f -size +50M ! -path './.git/*' -print0 | while IFS= read -r -d '' f; do
             ext="${f##*.}"
             git lfs track "*.$ext" 2>/dev/null || true
           done
 
-          # Generate SHA256 checksums
-          find . -maxdepth 3 -type f ! -path './.git/*' ! -name '*.sha256' -name '*.img' -print0 |             while IFS= read -r -d '' f; do
-              sha256sum "$f" > "$f.sha256" 2>/dev/null || true
-            done
+          # Generate SHA256 checksums.
+          find . -maxdepth 3 -type f ! -path './.git/*' ! -name '*.sha256' -name '*.img' -print0 | while IFS= read -r -d '' f; do
+            sha256sum "$f" > "$f.sha256" 2>/dev/null || true
+          done
 
-          # Generate file list
+          # Generate file list.
           find . -type f ! -path './.git/*' | sort > ./file_list.txt || true
 
           git add -A
           git diff --cached --quiet && { echo "Nothing to commit"; exit 0; }
           git commit -m "dump: $BRANCH [$(date -u '+%Y-%m-%d')]"
 
+          pushed=0
           for attempt in 1 2 3; do
-            git push origin "$BRANCH" && break
+            if git push origin "$BRANCH"; then
+              pushed=1
+              break
+            fi
             echo "Push attempt $attempt failed, retrying..."
             sleep 10
           done
+          [ "$pushed" -eq 1 ] || { echo "ERROR: GitHub push failed after retries"; exit 1; }
 
           echo "github_upload=success" >> /tmp/final_dump/_dump_info.txt
+
+      - name: Mirror to GitLab
+        if: inputs.upload_gitlab == 'true'
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          GITLAB_USERNAME: ${{ secrets.GITLAB_USERNAME }}
+          GITLAB_REPO: ${{ secrets.GITLAB_REPO }}
+        run: |
+          set -e
+          [ -z "$GITLAB_TOKEN" ] && echo "GITLAB_TOKEN not set, skipping." && exit 0
+          [ -z "$GITLAB_USERNAME" ] && echo "GITLAB_USERNAME not set, skipping." && exit 0
+          [ -z "$GITLAB_REPO" ] && echo "GITLAB_REPO not set, skipping." && exit 0
+
+          BRANCH='${{ steps.branch.outputs.target_branch }}'
+          REMOTE="https://${GITLAB_USERNAME}:${GITLAB_TOKEN}@gitlab.com/${GITLAB_USERNAME}/${GITLAB_REPO}.git"
+
+          rm -rf /tmp/gl_push
+          mkdir -p /tmp/gl_push
+          rsync -a /tmp/final_dump/ /tmp/gl_push/
+          cd /tmp/gl_push
+
+          git init -b "$BRANCH"
+          git config user.email "action@github.com"
+          git config user.name "GitHub Action"
+          git lfs install
+
+          find . -type f -size +50M ! -path './.git/*' -print0 | while IFS= read -r -d '' f; do
+            ext="${f##*.}"
+            git lfs track "*.$ext" 2>/dev/null || true
+          done
+
+          git add -A
+          git commit -m "dump: $BRANCH [auto]" || echo "Nothing to commit"
+          git remote add origin "$REMOTE"
+          git push --force origin "$BRANCH" || {
+            echo "WARNING: GitLab push failed. Continuing."
+            exit 0
+          }
+
+          echo "gitlab_upload=success" >> /tmp/final_dump/_dump_info.txt
+
+      - name: Mirror to Gitea / Codeberg
+        if: inputs.upload_gitea == 'true'
+        env:
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          GITEA_USERNAME: ${{ secrets.GITEA_USERNAME }}
+          GITEA_REPO: ${{ secrets.GITEA_REPO }}
+          GITEA_URL: ${{ secrets.GITEA_URL }}
+        run: |
+          set -e
+          [ -z "$GITEA_TOKEN" ] && echo "GITEA_TOKEN not set, skipping." && exit 0
+          [ -z "$GITEA_USERNAME" ] && echo "GITEA_USERNAME not set, skipping." && exit 0
+          [ -z "$GITEA_REPO" ] && echo "GITEA_REPO not set, skipping." && exit 0
+
+          BRANCH='${{ steps.branch.outputs.target_branch }}'
+          BASE_URL="${GITEA_URL:-https://codeberg.org}"
+          BASE_HOST="${BASE_URL#*://}"
+          AUTH_REMOTE="https://${GITEA_USERNAME}:${GITEA_TOKEN}@${BASE_HOST}/${GITEA_USERNAME}/${GITEA_REPO}.git"
+
+          rm -rf /tmp/gt_push
+          mkdir -p /tmp/gt_push
+          rsync -a /tmp/final_dump/ /tmp/gt_push/
+          cd /tmp/gt_push
+
+          git init -b "$BRANCH"
+          git config user.email "action@github.com"
+          git config user.name "GitHub Action"
+          git lfs install
+
+          find . -type f -size +50M ! -path './.git/*' -print0 | while IFS= read -r -d '' f; do
+            ext="${f##*.}"
+            git lfs track "*.$ext" 2>/dev/null || true
+          done
+
+          git add -A
+          git commit -m "dump: $BRANCH [auto]" || echo "Nothing to commit"
+          git remote add origin "$AUTH_REMOTE"
+          git push --force origin "$BRANCH" || {
+            echo "WARNING: Gitea push failed. Continuing."
+            exit 0
+          }
+
+          echo "gitea_upload=success" >> /tmp/final_dump/_dump_info.txt
+
+      - name: Upload to SourceForge (rsync over SSH)
+        if: inputs.upload_sourceforge == 'true'
+        env:
+          SF_USER: ${{ secrets.SF_USER }}
+          SF_PROJECT: ${{ secrets.SF_PROJECT }}
+          SF_SSH_KEY: ${{ secrets.SF_SSH_KEY }}
+        run: |
+          set -e
+          [ -z "$SF_USER" ] && echo "SF_USER not set, skipping." && exit 0
+          [ -z "$SF_PROJECT" ] && echo "SF_PROJECT not set, skipping." && exit 0
+          [ -z "$SF_SSH_KEY" ] && echo "SF_SSH_KEY not set, skipping." && exit 0
+
+          BRANCH='${{ steps.branch.outputs.target_branch }}'
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SF_SSH_KEY" > ~/.ssh/sf_key
+          chmod 600 ~/.ssh/sf_key
+          ssh-keyscan -H frs.sourceforge.net >> ~/.ssh/known_hosts 2>/dev/null || true
+
+          SF_PATH="/home/frs/project/${SF_PROJECT}/${BRANCH}/"
+          rsync -avz --progress \
+            -e "ssh -i ~/.ssh/sf_key -o StrictHostKeyChecking=no" \
+            /tmp/final_dump/ \
+            "${SF_USER}@frs.sourceforge.net:${SF_PATH}" || {
+            echo "WARNING: SourceForge upload failed. Continuing."
+            rm -f ~/.ssh/sf_key
+            exit 0
+          }
+
+          rm -f ~/.ssh/sf_key
+          echo "sourceforge_upload=success" >> /tmp/final_dump/_dump_info.txt
+
+      - name: Upload to Cloudflare R2 (S3-compatible)
+        if: inputs.upload_r2 == 'true'
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+        run: |
+          set -e
+          [ -z "$R2_ACCESS_KEY_ID" ] && echo "R2_ACCESS_KEY_ID not set, skipping." && exit 0
+          [ -z "$R2_SECRET_ACCESS_KEY" ] && echo "R2_SECRET_ACCESS_KEY not set, skipping." && exit 0
+          [ -z "$R2_BUCKET" ] && echo "R2_BUCKET not set, skipping." && exit 0
+          [ -z "$R2_ENDPOINT" ] && echo "R2_ENDPOINT not set, skipping." && exit 0
+
+          BRANCH='${{ steps.branch.outputs.target_branch }}'
+
+          AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" \
+          AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" \
+          aws s3 sync /tmp/final_dump/ "s3://${R2_BUCKET}/${BRANCH}/" \
+            --endpoint-url "$R2_ENDPOINT" \
+            --no-progress \
+            --only-show-errors || {
+            echo "WARNING: R2 upload failed. Continuing."
+            exit 0
+          }
+
+          echo "r2_upload=success" >> /tmp/final_dump/_dump_info.txt
