@@ -29,6 +29,14 @@ on:
         default: "false"
         type: choice
         options: ["false", "true"]
+
+      upload_github_branch:
+        description: "Upload to this GitHub repo branch (smart branch)"
+        required: false
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+
       upload_gitlab:
         description: "Upload to GitLab"
         required: false
@@ -219,6 +227,7 @@ jobs:
           done
 
       - name: Push to target branch on GitHub (smart)
+        if: inputs.upload_github_branch == 'true'
         run: |
           set -e
           BRANCH='${{ steps.branch.outputs.target_branch }}'
@@ -281,6 +290,13 @@ jobs:
           [ "$pushed" -eq 1 ] || { echo "ERROR: GitHub push failed after retries"; exit 1; }
 
           echo "github_upload=success" >> /tmp/final_dump/_dump_info.txt
+
+      - name: Mark GitHub upload disabled
+        if: inputs.upload_github_branch == 'false'
+        run: |
+          set -e
+          echo "github_upload=disabled" >> /tmp/final_dump/_dump_info.txt
+          echo "GitHub branch upload is disabled by input."
 
       - name: Mirror to GitLab
         if: inputs.upload_gitlab == 'true'
