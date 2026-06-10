@@ -140,12 +140,68 @@ jobs:
             fi
           fi
 
+      - name: Fallback unpack for Infinix/Transsion archives
+        if: always()
+        run: |
+          set -e
+
+          # If DumprX already produced files, skip fallback.
+          if [ -d /tmp/DumprX/out ] && [ -n "$(find /tmp/DumprX/out -type f | head -n1)" ]; then
+            echo "DumprX output exists. Fallback not needed."
+            exit 0
+          fi
+
+          archive="$(find /tmp/DumprX/input -maxdepth 1 -type f \( -iname '*.rar' -o -iname '*.zip' -o -iname '*.7z' \) | head -n1 || true)"
+          if [ -z "$archive" ]; then
+            echo "No archive found in /tmp/DumprX/input for fallback."
+            exit 0
+          fi
+
+          echo "Fallback archive detected: $archive"
+          rm -rf /tmp/manual_extract
+          mkdir -p /tmp/manual_extract /tmp/DumprX/out
+
+          # Try extracting archive with 7z first.
+          if ! 7z x -y "$archive" -o/tmp/manual_extract >/tmp/manual_extract.log 2>&1; then
+            echo "Fallback extraction failed. Last lines:"
+            tail -n 40 /tmp/manual_extract.log || true
+            exit 0
+          fi
+
+          # Copy known dump artifacts to DumprX out directory.
+          find /tmp/manual_extract -type f \( \
+            -iname '*.img' -o -iname '*.bin' -o -iname '*.mbn' -o -iname '*.elf' -o \
+            -iname 'payload.bin' -o -iname 'super.img*' -o -iname '*scatter*.txt' \
+          \) -print0 | while IFS= read -r -d '' f; do
+            cp -f "$f" /tmp/DumprX/out/ 2>/dev/null || true
+          done
+
+          # Keep metadata so branch resolver has context.
+          {
+            echo "# Manual fallback output"
+            echo "- Source archive: $(basename "$archive")"
+            echo "- Note: DumprX parser failed, raw extracted files copied."
+          } > /tmp/DumprX/out/README.md
+
+          if [ -n "$(find /tmp/DumprX/out -type f | head -n1)" ]; then
+            echo "Fallback extraction created output files."
+          else
+            echo "Fallback extraction found no usable partition files."
+          fi
+
       - name: Collect output
         run: |
           set -e
           mkdir -p /tmp/final_dump
           [ -d /tmp/DumprX/out ] || { echo "ERROR: /tmp/DumprX/out missing"; exit 1; }
           rsync -a /tmp/DumprX/out/ /tmp/final_dump/
+
+          # Fail fast if DumprX produced no real files.
+          find /tmp/final_dump -type f | grep -q . || {
+            echo "ERROR: DumprX produced no output files."
+            echo "Hint: The ROM URL may not be a direct downloadable link, or format is unsupported (.ofp/.rar variants)."
+            exit 1
+          }
 
           {
             echo "rom_url=${{ steps.input.outputs.rom_url }}"
