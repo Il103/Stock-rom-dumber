@@ -1,4 +1,4 @@
-name: HyperOS ROM Dumper (DumprX -> Multi Upload)
+name: Stock ROM Dumper (DumprX -> Multi Upload)
 
 on:
   workflow_dispatch:
