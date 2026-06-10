@@ -193,7 +193,7 @@ jobs:
             sudo chown -R "$USER:$USER" "$out" 2>/dev/null || true
           done
 
-      - name: Push to target branch (smart)
+      - name: Push to target branch on GitHub (smart)
         run: |
           set -e
           BRANCH='${{ steps.branch.outputs.target_branch }}'
@@ -204,6 +204,8 @@ jobs:
           git config --global http.version HTTP/1.1
           git config --global http.postBuffer 1048576000
           git config --global core.compression 0
+          git config --global user.email "action@github.com"
+          git config --global user.name "GitHub Action"
 
           git fetch origin
           if git ls-remote --heads origin "$BRANCH" | grep -q "$BRANCH"; then
@@ -212,114 +214,40 @@ jobs:
             git checkout --orphan "$BRANCH"
           fi
 
-          # Branch root only.
+          # Clear branch root only
           find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
           rsync -a /tmp/final_dump/ ./
 
-          # Skip oversized APKs and print skipped names.
+          # Skip oversized APKs and log them
           rm -f /tmp/skipped_apk_report.txt
           find . -type f -name '*.apk' -size +100M -print0 | while IFS= read -r -d '' apk; do
-            rel=${apk#./}
-            sz=$(du -h "$apk" | cut -f1)
-            echo "Skipping oversized APK: $rel ($sz)"
-            printf '%s | %s\n' "$rel" "$sz" >> /tmp/skipped_apk_report.txt
+            echo "SKIPPED (>100MB APK): $apk" | tee -a /tmp/skipped_apk_report.txt
             rm -f "$apk"
           done
+          [ -f /tmp/skipped_apk_report.txt ] && cat /tmp/skipped_apk_report.txt >> ./_dump_info.txt || true
 
-          if [ -f /tmp/skipped_apk_report.txt ]; then
-            {
-              echo
-              echo "## Skipped APKs (>100MB)"
-              cat /tmp/skipped_apk_report.txt
-            } >> _dump_info.txt
-          fi
-
-          # Create LFS rules without heredoc to avoid YAML parsing issues.
-          rm -f .gitattributes
-          printf '%s\n' '*.img filter=lfs diff=lfs merge=lfs -text' >> .gitattributes
-          printf '%s\n' '*.img.xz filter=lfs diff=lfs merge=lfs -text' >> .gitattributes
-          printf '%s\n' '*.bin filter=lfs diff=lfs merge=lfs -text' >> .gitattributes
-          printf '%s\n' '*.new.dat filter=lfs diff=lfs merge=lfs -text' >> .gitattributes
-          printf '%s\n' '*.dat filter=lfs diff=lfs merge=lfs -text' >> .gitattributes
-          printf '%s\n' '*.br filter=lfs diff=lfs merge=lfs -text' >> .gitattributes
-          printf '%s\n' '*.payload filter=lfs diff=lfs merge=lfs -text' >> .gitattributes
-          printf '%s\n' '*.apk filter=lfs diff=lfs merge=lfs -text' >> .gitattributes
-          printf '%s\n' '*.apex filter=lfs diff=lfs merge=lfs -text' >> .gitattributes
-          printf '%s\n' '*.jar filter=lfs diff=lfs merge=lfs -text' >> .gitattributes
-          printf '%s\n' '*.zip filter=lfs diff=lfs merge=lfs -text' >> .gitattributes
-
-          # Safety net for big files.
-          find . -type f -size +95M -print0 | while IFS= read -r -d '' f; do
-            rel=${f#./}
-            printf '%s filter=lfs diff=lfs merge=lfs -text\n' "$rel" >> .gitattributes
+          # Track large files with LFS
+          find . -type f -size +50M ! -path './.git/*' -print0 | while IFS= read -r -d '' f; do
+            ext="${f##*.}"
+            git lfs track "*.$ext" 2>/dev/null || true
           done
-          sort -u .gitattributes -o .gitattributes
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          push_retry() {
-            tries=5
-            n=1
-            while [ "$n" -le "$tries" ]; do
-              if git push -f origin "$BRANCH"; then
-                return 0
-              fi
-              echo "Push failed ($n/$tries), retry in 15s..."
-              sleep 15
-              n=$((n + 1))
+          # Generate SHA256 checksums
+          find . -maxdepth 3 -type f ! -path './.git/*' ! -name '*.sha256' -name '*.img' -print0 |             while IFS= read -r -d '' f; do
+              sha256sum "$f" > "$f.sha256" 2>/dev/null || true
             done
-            return 1
-          }
 
-          # Chunked commits for stability.
-          git add .gitattributes
-          if ! git diff --cached --quiet; then
-            git commit -m "dump: lfs rules"
-            push_retry
-          fi
+          # Generate file list
+          find . -type f ! -path './.git/*' | sort > ./file_list.txt || true
 
-          for p in *; do
-            [ -e "$p" ] || continue
-            [ "$p" = ".git" ] && continue
-            git add "$p"
-            if git diff --cached --quiet; then
-              continue
-            fi
-            git commit -m "dump: add $p"
-            push_retry
+          git add -A
+          git diff --cached --quiet && { echo "Nothing to commit"; exit 0; }
+          git commit -m "dump: $BRANCH [$(date -u '+%Y-%m-%d')]"
+
+          for attempt in 1 2 3; do
+            git push origin "$BRANCH" && break
+            echo "Push attempt $attempt failed, retrying..."
+            sleep 10
           done
 
-          git add .
-          if ! git diff --cached --quiet; then
-            git commit -m "dump: finalize"
-            push_retry
-          fi
-
-      - name: Job summary
-        if: always()
-        run: |
-          {
-            echo "## DumprX Dump Complete"
-            echo
-            echo "- URL used exactly: \`${{ steps.input.outputs.rom_url }}\`"
-            echo "- Target branch: \`${{ steps.branch.outputs.target_branch }}\`"
-            echo "- Push mode: same repo, branch root"
-            echo "- Release upload: disabled"
-            echo
-
-            if [ -d /tmp/final_dump ]; then
-              echo "### Top-level files"
-              echo '```'
-              ls -lah /tmp/final_dump | sed -n '1,200p'
-              echo '```'
-            fi
-
-            if [ -f /tmp/skipped_apk_report.txt ]; then
-              echo
-              echo "### Skipped APKs (>100MB)"
-              echo '```'
-              cat /tmp/skipped_apk_report.txt
-              echo '```'
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "github_upload=success" >> /tmp/final_dump/_dump_info.txt
