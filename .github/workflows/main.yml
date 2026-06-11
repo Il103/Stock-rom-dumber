@@ -17,6 +17,12 @@ on:
         required: false
         default: "unknown"
         type: string
+      dump_engine:
+        description: "Dump engine (default: dumprx)"
+        required: false
+        default: "dumprx"
+        type: choice
+        options: ["dumprx", "payload_dumper_go", "raw_archive_extract"]
       extract_contents:
         description: "Try extracting filesystem contents from images"
         required: false
@@ -116,13 +122,27 @@ jobs:
           echo "rom_url=$URL" >> "$GITHUB_OUTPUT"
           echo "Using URL exactly: $URL"
 
+      - name: Select dump engine
+        id: engine
+        run: |
+          set -e
+          engine='${{ inputs.dump_engine }}'
+          case "$engine" in
+            dumprx|payload_dumper_go|raw_archive_extract) ;;
+            *) echo "ERROR: unsupported dump engine: $engine"; exit 1 ;;
+          esac
+          echo "name=$engine" >> "$GITHUB_OUTPUT"
+          echo "Selected dump engine: $engine"
+
       - name: Clone DumprX
+        if: steps.engine.outputs.name == 'dumprx'
         run: |
           set -e
           rm -rf /tmp/DumprX
           git clone --depth=1 https://github.com/DumprX/DumprX.git /tmp/DumprX
 
       - name: Run DumprX with exact URL
+        if: steps.engine.outputs.name == 'dumprx'
         run: |
           set +e
           cd /tmp/DumprX
@@ -140,8 +160,82 @@ jobs:
             fi
           fi
 
+      - name: Run payload-dumper-go
+        if: steps.engine.outputs.name == 'payload_dumper_go'
+        run: |
+          set -e
+          URL='${{ steps.input.outputs.rom_url }}'
+
+          mkdir -p /tmp/payload_work /tmp/tool_out
+          cd /tmp/payload_work
+
+          curl -fL --retry 3 --retry-delay 3 "$URL" -o input.bin
+          mime="$(file -b --mime-type input.bin)"
+          echo "Downloaded mime type: $mime"
+          case "$mime" in
+            text/html|text/plain)
+              echo "ERROR: URL returned text/html, not firmware file"
+              exit 1
+              ;;
+          esac
+
+          payload=""
+          if grep -aq "CrAU" input.bin; then
+            payload="/tmp/payload_work/input.bin"
+          else
+            mkdir -p /tmp/payload_work/unpack
+            7z x -y input.bin -o/tmp/payload_work/unpack >/tmp/payload_work/unpack.log 2>&1 || true
+            payload="$(find /tmp/payload_work/unpack -type f -iname 'payload.bin' | head -n1 || true)"
+          fi
+
+          [ -n "$payload" ] || { echo "ERROR: payload.bin not found"; exit 1; }
+
+          if ! command -v go >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends golang-go
+          fi
+
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          go install github.com/ssut/payload-dumper-go@latest
+
+          cd /tmp/tool_out
+          payload-dumper-go "$payload"
+
+      - name: Run raw archive extractor
+        if: steps.engine.outputs.name == 'raw_archive_extract'
+        run: |
+          set -e
+          URL='${{ steps.input.outputs.rom_url }}'
+
+          mkdir -p /tmp/raw_work /tmp/tool_out
+          cd /tmp/raw_work
+
+          curl -fL --retry 3 --retry-delay 3 "$URL" -o input.bin
+          mime="$(file -b --mime-type input.bin)"
+          echo "Downloaded mime type: $mime"
+          case "$mime" in
+            text/html|text/plain)
+              echo "ERROR: URL returned text/html, not firmware file"
+              exit 1
+              ;;
+          esac
+
+          mkdir -p /tmp/raw_work/unpack
+          7z x -y input.bin -o/tmp/raw_work/unpack >/tmp/raw_work/unpack.log 2>&1 || {
+            echo "ERROR: archive extract failed"
+            tail -n 60 /tmp/raw_work/unpack.log || true
+            exit 1
+          }
+
+          find /tmp/raw_work/unpack -type f \( \
+            -iname '*.img' -o -iname '*.bin' -o -iname '*.mbn' -o -iname '*.elf' -o \
+            -iname 'payload.bin' -o -iname 'super.img*' -o -iname '*scatter*.txt' \
+          \) -print0 | while IFS= read -r -d '' f; do
+            cp -f "$f" /tmp/tool_out/ 2>/dev/null || true
+          done
+
       - name: Fallback unpack for Infinix/Transsion archives
-        if: always()
+        if: steps.engine.outputs.name == 'dumprx'
         run: |
           set -e
 
@@ -198,12 +292,23 @@ jobs:
             echo "Fallback extraction found no usable partition files."
           fi
 
+      - name: Resolve output directory
+        id: outdir
+        run: |
+          set -e
+          case '${{ steps.engine.outputs.name }}' in
+            dumprx) echo "path=/tmp/DumprX/out" >> "$GITHUB_OUTPUT" ;;
+            payload_dumper_go|raw_archive_extract) echo "path=/tmp/tool_out" >> "$GITHUB_OUTPUT" ;;
+            *) echo "ERROR: invalid engine output"; exit 1 ;;
+          esac
+
       - name: Collect output
         run: |
           set -e
+          OUT_DIR='${{ steps.outdir.outputs.path }}'
           mkdir -p /tmp/final_dump
-          [ -d /tmp/DumprX/out ] || { echo "ERROR: /tmp/DumprX/out missing"; exit 1; }
-          rsync -a /tmp/DumprX/out/ /tmp/final_dump/
+          [ -d "$OUT_DIR" ] || { echo "ERROR: output directory missing: $OUT_DIR"; exit 1; }
+          rsync -a "$OUT_DIR"/ /tmp/final_dump/
 
           # Fail fast if no real partition payload was produced.
           find /tmp/final_dump -type f \( -iname '*.img' -o -iname '*.bin' -o -iname '*.mbn' -o -iname 'payload.bin' -o -iname 'super.img*' \) | grep -q . || {
@@ -214,6 +319,7 @@ jobs:
 
           {
             echo "rom_url=${{ steps.input.outputs.rom_url }}"
+            echo "dump_engine=${{ steps.engine.outputs.name }}"
             echo "target_branch_input=${{ inputs.target_branch }}"
             echo "device_name_input=${{ inputs.device_name }}"
             echo "workflow_run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
