@@ -469,6 +469,7 @@ jobs:
 
           find /tmp/final_dump -type f -name '*.apk' -size +100M -delete 2>/dev/null || true
           git lfs install --skip-smudge || true
+          git lfs track "*.img" "*.bin" "*.elf" "*.mbn" "payload.bin" "super.img*" || true
 
           REMOTE_URL="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
 
@@ -576,6 +577,11 @@ jobs:
           git checkout -B "$BRANCH"
           git remote add origin "$AUTH_REMOTE"
 
+          # Prevent HTTP 413 by sending heavy blobs via Git LFS.
+          git lfs install --local || true
+          git lfs track "*.img" "*.bin" "*.elf" "*.mbn" "payload.bin" "super.img*" || true
+          git config lfs.concurrenttransfers 3 || true
+
           # Validate auth and repository path before committing big data.
           git ls-remote origin >/dev/null 2>&1 || {
             echo "ERROR: GitLab auth/repo check failed (403 غالبا token scope أو repo path غلط)."
@@ -585,19 +591,56 @@ jobs:
           }
 
           find . -type f -name '*.apk' -size +100M -delete 2>/dev/null || true
-          git add -A
-          git commit -m "dump: $BRANCH [$(date -u '+%Y-%m-%d %H:%M UTC')]" || echo "Nothing new to commit"
 
-          ok=false
-          for i in 1 2 3; do
-            if git push origin "$BRANCH" --force; then
-              ok=true
-              break
+          push_with_retry() {
+            local mode="${1:-normal}"
+            local ok=false
+            for i in 1 2 3; do
+              if [ "$mode" = "force" ]; then
+                if git push origin "$BRANCH" --force; then
+                  ok=true
+                  break
+                fi
+              else
+                if git push origin "$BRANCH"; then
+                  ok=true
+                  break
+                fi
+              fi
+              echo "GitLab push attempt $i failed."
+              sleep 5
+            done
+            [ "$ok" = true ] || return 1
+          }
+
+          # Seed branch with tiny first commit to avoid force-pushing huge first pack.
+          echo "dump_engine=${{ steps.engine.outputs.name }}" > .dump_seed.txt
+          git add .dump_seed.txt .gitattributes
+          git commit -m "seed: $BRANCH [$(date -u '+%Y-%m-%d %H:%M UTC')]" || true
+          push_with_retry force || { echo "ERROR: GitLab seed push failed"; exit 1; }
+
+          # Push data in small batches to reduce HTTP payload per request.
+          BATCH_SIZE=35
+          staged=0
+          batch_no=1
+
+          while IFS= read -r -d '' f; do
+            [ "$f" = "./.dump_seed.txt" ] && continue
+            git add "$f"
+            staged=$((staged + 1))
+
+            if [ "$staged" -ge "$BATCH_SIZE" ]; then
+              git commit -m "dump batch ${batch_no}: $BRANCH [$(date -u '+%Y-%m-%d %H:%M UTC')]" || true
+              push_with_retry || { echo "ERROR: GitLab batch push failed at batch ${batch_no}"; exit 1; }
+              staged=0
+              batch_no=$((batch_no + 1))
             fi
-            echo "GitLab push attempt $i failed."
-            sleep 5
-          done
-          [ "$ok" = true ] || { echo "ERROR: GitLab upload failed after retries"; exit 1; }
+          done < <(find . -type f -not -path './.git/*' -print0)
+
+          if ! git diff --cached --quiet; then
+            git commit -m "dump final: $BRANCH [$(date -u '+%Y-%m-%d %H:%M UTC')]" || true
+            push_with_retry || { echo "ERROR: GitLab final push failed"; exit 1; }
+          fi
 
       - name: Mirror to Gitea / Codeberg
         if: inputs.upload_gitea == 'true'
