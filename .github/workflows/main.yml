@@ -95,7 +95,8 @@ jobs:
             git git-lfs curl jq file rsync unzip tar zip \
             python3 python3-pip xz-utils p7zip-full sharutils cabextract \
             brotli liblz4-tool gawk detox cpio rename \
-            device-tree-compiler e2fsprogs openssh-client
+            device-tree-compiler e2fsprogs openssh-client \
+            build-essential pkg-config liblzma-dev libzstd-dev
 
           optional_pkgs=(
             unrar
