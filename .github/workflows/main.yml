@@ -65,6 +65,22 @@ on:
         default: "false"
         type: choice
         options: ["false", "true"]
+      gitlab_max_file_size_mb:
+        description: "GitLab upload: drop files larger than this size in MB"
+        required: false
+        default: "1024"
+        type: string
+      gitlab_exclude_files:
+        description: "GitLab upload: space-separated file globs to skip"
+        required: false
+        default: "userdata.img super.img"
+        type: string
+      gitlab_quota_soft_fail:
+        description: "Do not fail workflow if GitLab quota is exceeded"
+        required: false
+        default: "true"
+        type: choice
+        options: ["true", "false"]
 
 jobs:
   dump-rom:
@@ -592,20 +608,38 @@ jobs:
 
           find . -type f -name '*.apk' -size +100M -delete 2>/dev/null || true
 
+          MAX_MB='${{ inputs.gitlab_max_file_size_mb }}'
+          EXCLUDES='${{ inputs.gitlab_exclude_files }}'
+          SOFT_FAIL='${{ inputs.gitlab_quota_soft_fail }}'
+          case "$MAX_MB" in
+            ''|*[!0-9]*) MAX_MB=1024 ;;
+          esac
+
+          # Reduce GitLab payload size to avoid quota/limit failures.
+          for pat in $EXCLUDES; do
+            find . -type f -name "$pat" -print -delete 2>/dev/null || true
+          done
+          find . -type f -size +"${MAX_MB}"M -print -delete 2>/dev/null || true
+
           push_with_retry() {
             local mode="${1:-normal}"
             local ok=false
+            QUOTA_HIT=false
             for i in 1 2 3; do
               if [ "$mode" = "force" ]; then
-                if git push origin "$BRANCH" --force; then
+                if git push origin "$BRANCH" --force 2>&1 | tee /tmp/gitlab_push_last.log; then
                   ok=true
                   break
                 fi
               else
-                if git push origin "$BRANCH"; then
+                if git push origin "$BRANCH" 2>&1 | tee /tmp/gitlab_push_last.log; then
                   ok=true
                   break
                 fi
+              fi
+              if grep -qi "exceed the allocated storage" /tmp/gitlab_push_last.log; then
+                QUOTA_HIT=true
+                return 2
               fi
               echo "GitLab push attempt $i failed."
               sleep 5
@@ -617,7 +651,15 @@ jobs:
           echo "dump_engine=${{ steps.engine.outputs.name }}" > .dump_seed.txt
           git add .dump_seed.txt .gitattributes
           git commit -m "seed: $BRANCH [$(date -u '+%Y-%m-%d %H:%M UTC')]" || true
-          push_with_retry force || { echo "ERROR: GitLab seed push failed"; exit 1; }
+          push_with_retry force || {
+            rc=$?
+            if [ "$rc" -eq 2 ] && [ "$SOFT_FAIL" = "true" ]; then
+              echo "WARNING: GitLab quota exceeded. Soft-fail enabled, skipping GitLab upload."
+              exit 0
+            fi
+            echo "ERROR: GitLab seed push failed"
+            exit 1
+          }
 
           # Push data in small batches to reduce HTTP payload per request.
           BATCH_SIZE=35
@@ -631,7 +673,15 @@ jobs:
 
             if [ "$staged" -ge "$BATCH_SIZE" ]; then
               git commit -m "dump batch ${batch_no}: $BRANCH [$(date -u '+%Y-%m-%d %H:%M UTC')]" || true
-              push_with_retry || { echo "ERROR: GitLab batch push failed at batch ${batch_no}"; exit 1; }
+              push_with_retry || {
+                rc=$?
+                if [ "$rc" -eq 2 ] && [ "$SOFT_FAIL" = "true" ]; then
+                  echo "WARNING: GitLab quota exceeded at batch ${batch_no}. Soft-fail enabled, stopping GitLab upload."
+                  exit 0
+                fi
+                echo "ERROR: GitLab batch push failed at batch ${batch_no}"
+                exit 1
+              }
               staged=0
               batch_no=$((batch_no + 1))
             fi
@@ -639,7 +689,15 @@ jobs:
 
           if ! git diff --cached --quiet; then
             git commit -m "dump final: $BRANCH [$(date -u '+%Y-%m-%d %H:%M UTC')]" || true
-            push_with_retry || { echo "ERROR: GitLab final push failed"; exit 1; }
+            push_with_retry || {
+              rc=$?
+              if [ "$rc" -eq 2 ] && [ "$SOFT_FAIL" = "true" ]; then
+                echo "WARNING: GitLab quota exceeded at final push. Soft-fail enabled, stopping GitLab upload."
+                exit 0
+              fi
+              echo "ERROR: GitLab final push failed"
+              exit 1
+            }
           fi
 
       - name: Mirror to Gitea / Codeberg
