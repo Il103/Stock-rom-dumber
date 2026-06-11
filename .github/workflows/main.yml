@@ -186,7 +186,18 @@ jobs:
             payload="/tmp/payload_work/input.bin"
           else
             mkdir -p /tmp/payload_work/unpack
-            7z x -y input.bin -o/tmp/payload_work/unpack >/tmp/payload_work/unpack.log 2>&1 || true
+            # Try nested decompression/extraction for links serving gzip/tar wrappers.
+            inner="/tmp/payload_work/input.bin"
+            if gzip -t /tmp/payload_work/input.bin >/dev/null 2>&1; then
+              echo "Detected gzip wrapper, decompressing..."
+              gzip -dc /tmp/payload_work/input.bin > /tmp/payload_work/input.dec 2>/dev/null || true
+              [ -s /tmp/payload_work/input.dec ] && inner="/tmp/payload_work/input.dec"
+            fi
+
+            tar -xf "$inner" -C /tmp/payload_work/unpack >/tmp/payload_work/unpack.log 2>&1 || true
+            7z x -y "$inner" -o/tmp/payload_work/unpack >>/tmp/payload_work/unpack.log 2>&1 || true
+            7z x -y /tmp/payload_work/input.bin -o/tmp/payload_work/unpack >>/tmp/payload_work/unpack.log 2>&1 || true
+
             payload="$(find /tmp/payload_work/unpack -type f -iname 'payload.bin' | head -n1 || true)"
 
             # Some packages store payload as payload.bin.gz.
@@ -200,7 +211,7 @@ jobs:
           fi
 
           if [ -z "$payload" ]; then
-            echo "payload.bin not found, fallback to raw partition extraction from archive contents."
+            echo "payload.bin not found, trying raw partition extraction from archive contents."
             find /tmp/payload_work/unpack -type f \( \
               -iname '*.img' -o -iname '*.bin' -o -iname '*.mbn' -o -iname '*.elf' -o \
               -iname 'super.img*' -o -iname '*scatter*.txt' \
@@ -209,8 +220,13 @@ jobs:
             done
 
             raw_count="$(find /tmp/tool_out -type f \( -iname '*.img' -o -iname '*.bin' -o -iname '*.mbn' -o -iname 'super.img*' \) | wc -l)"
-            [ "$raw_count" -gt 0 ] || { echo "ERROR: payload-dumper-go mode: no payload.bin and no raw partition files found"; exit 1; }
-            echo "Raw partition fallback extracted $raw_count files."
+            if [ "$raw_count" -gt 0 ]; then
+              echo "Raw partition fallback extracted $raw_count files."
+              exit 0
+            fi
+
+            # Do not fail here. A dedicated fallback step will try DumprX.
+            echo "No payload/raw files found in payload-dumper-go mode."
             exit 0
           fi
 
@@ -223,7 +239,34 @@ jobs:
           go install github.com/ssut/payload-dumper-go@latest
 
           cd /tmp/tool_out
-          payload-dumper-go "$payload"
+          payload-dumper-go "$payload" || echo "payload-dumper-go failed. Will try DumprX fallback in next step."
+
+      - name: Fallback to DumprX when selected engine has no output
+        if: steps.engine.outputs.name != 'dumprx'
+        run: |
+          set -e
+
+          # If alternate engine produced usable output, skip fallback.
+          if find /tmp/tool_out -type f \( -iname '*.img' -o -iname '*.bin' -o -iname '*.mbn' -o -iname 'payload.bin' -o -iname 'super.img*' \) | grep -q .; then
+            echo "Alternate engine output exists. DumprX fallback not needed."
+            exit 0
+          fi
+
+          echo "No usable output from selected engine. Running DumprX fallback..."
+          rm -rf /tmp/DumprX
+          git clone --depth=1 https://github.com/DumprX/DumprX.git /tmp/DumprX
+          cd /tmp/DumprX
+          chmod +x dumper.sh setup.sh
+          export TERM=xterm
+          ./dumper.sh '${{ steps.input.outputs.rom_url }}' || true
+
+          if [ -d /tmp/DumprX/out ] && [ -n "$(find /tmp/DumprX/out -type f | head -n1)" ]; then
+            rsync -a /tmp/DumprX/out/ /tmp/tool_out/
+            echo "DumprX fallback succeeded."
+          else
+            echo "ERROR: No output from selected engine and DumprX fallback failed."
+            exit 1
+          fi
 
       - name: Run raw archive extractor
         if: steps.engine.outputs.name == 'raw_archive_extract'
