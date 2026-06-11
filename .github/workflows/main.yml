@@ -1,4 +1,4 @@
-name: HyperOS ROM Dumper (DumprX -> Multi Upload)
+name: Stock ROM Dumper (DumprX -> Multi Upload)
 
 on:
   workflow_dispatch:
@@ -29,7 +29,6 @@ on:
         default: "false"
         type: choice
         options: ["false", "true"]
-
       upload_github_branch:
         description: "Upload to this repo smart branch"
         required: false
@@ -86,15 +85,12 @@ jobs:
         run: |
           set -e
           sudo apt-get update -qq
-
-          # Required packages (must exist)
           sudo apt-get install -y --no-install-recommends \
             git git-lfs curl jq file rsync unzip tar zip \
             python3 python3-pip xz-utils p7zip-full sharutils cabextract \
             brotli liblz4-tool gawk detox cpio rename \
-            device-tree-compiler e2fsprogs
+            device-tree-compiler e2fsprogs openssh-client
 
-          # Optional packages (install if available, do not fail workflow if missing)
           optional_pkgs=(
             unrar
             android-sdk-libsparse-utils
@@ -109,11 +105,6 @@ jobs:
               echo "Optional package not available on this runner: $pkg"
             fi
           done
-
-          if ! command -v uv >/dev/null 2>&1; then
-            curl -fsSL https://astral.sh/uv/install.sh | sh
-            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          fi
 
       - name: Validate URL
         id: input
@@ -140,7 +131,6 @@ jobs:
 
           ./dumper.sh '${{ steps.input.outputs.rom_url }}'
           code=$?
-
           if [ "$code" -ne 0 ]; then
             if [ -d /tmp/DumprX/out ] && [ -n "$(find /tmp/DumprX/out -type f | head -n1)" ]; then
               echo "DumprX returned non-zero but output exists. Continuing."
@@ -228,87 +218,54 @@ jobs:
                 continue
               fi
             fi
-
-            loop=$(sudo losetup -f --show "$img" 2>/dev/null || true)
-            if [ -n "$loop" ]; then
-              mnt=/tmp/mnt_$name
-              mkdir -p "$mnt"
-              if sudo mount -o ro "$loop" "$mnt" 2>/dev/null; then
-                sudo rsync -a "$mnt/" "$out/" || true
-                sudo umount "$mnt" 2>/dev/null || true
-              fi
-              sudo losetup -d "$loop" 2>/dev/null || true
-            fi
-
-            sudo chown -R "$USER:$USER" "$out" 2>/dev/null || true
-          done
+          done || true
 
       - name: Push to target branch (smart)
         if: inputs.upload_github_branch == 'true'
         run: |
           set -e
-          BRANCH='${{ steps.branch.outputs.target_branch }}'
-          [ -n "$BRANCH" ] || { echo "ERROR: target branch empty"; exit 1; }
-          [ "$BRANCH" != "main" ] || { echo "ERROR: target branch cannot be main"; exit 1; }
+          BRANCH="${{ steps.branch.outputs.target_branch }}"
 
-          git lfs install
-          git config --global http.version HTTP/1.1
-          git config --global http.postBuffer 1048576000
-          git config --global core.compression 0
-          git config --global user.email "action@github.com"
-          git config --global user.name "GitHub Action"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-          git fetch origin
-          if git ls-remote --heads origin "$BRANCH" | grep -q "$BRANCH"; then
-            git checkout -B "$BRANCH" "origin/$BRANCH"
+          find /tmp/final_dump -type f -name '*.apk' -size +100M -delete 2>/dev/null || true
+          git lfs install --skip-smudge || true
+
+          REMOTE_URL="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+
+          if git ls-remote --exit-code --heads "$REMOTE_URL" "$BRANCH" >/dev/null 2>&1; then
+            git fetch origin "$BRANCH" --depth=1
+            git checkout "$BRANCH"
           else
             git checkout --orphan "$BRANCH"
+            git rm -rf . --quiet 2>/dev/null || true
           fi
 
-          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
-          rsync -a /tmp/final_dump/ ./
-
-          rm -f /tmp/skipped_apk_report.txt
-          find . -type f -name '*.apk' -size +100M -print0 | while IFS= read -r -d '' apk; do
-            echo "SKIPPED (>100MB APK): $apk" | tee -a /tmp/skipped_apk_report.txt
-            rm -f "$apk"
-          done
-          [ -f /tmp/skipped_apk_report.txt ] && cat /tmp/skipped_apk_report.txt >> ./_dump_info.txt || true
-
-          find . -type f -size +50M ! -path './.git/*' -print0 | while IFS= read -r -d '' f; do
-            ext="${f##*.}"
-            git lfs track "*.$ext" 2>/dev/null || true
-          done
-
-          find . -maxdepth 3 -type f ! -path './.git/*' ! -name '*.sha256' -name '*.img' -print0 | while IFS= read -r -d '' f; do
-            sha256sum "$f" > "$f.sha256" 2>/dev/null || true
-          done
-
-          find . -type f ! -path './.git/*' | sort > ./file_list.txt || true
+          rsync -a --exclude='.git' /tmp/final_dump/ ./
+          find . -not -path './.git/*' -type f | sort > file_list.txt
+          find . -not -path './.git/*' -type f -exec sha256sum {} \; > checksums.sha256
 
           git add -A
-          git diff --cached --quiet && { echo "Nothing to commit"; exit 0; }
-          git commit -m "dump: $BRANCH [$(date -u '+%Y-%m-%d')]"
-
-          ok=0
-          for attempt in 1 2 3; do
-            if git push origin "$BRANCH"; then
-              ok=1
-              break
-            fi
-            echo "Push attempt $attempt failed, retrying..."
-            sleep 10
-          done
-          [ "$ok" -eq 1 ] || { echo "ERROR: GitHub push failed after retries"; exit 1; }
-
-          echo "github_upload=success" >> /tmp/final_dump/_dump_info.txt
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+          else
+            git commit -m "dump: $BRANCH [$(date -u '+%Y-%m-%d %H:%M UTC')]"
+            ok=false
+            for i in 1 2 3; do
+              if git push "$REMOTE_URL" "$BRANCH"; then
+                ok=true
+                break
+              fi
+              echo "GitHub push attempt $i failed, retrying..."
+              sleep 5
+            done
+            [ "$ok" = true ] || { echo "ERROR: GitHub upload failed after retries"; exit 1; }
+          fi
 
       - name: GitHub upload disabled
-        if: inputs.upload_github_branch == 'false'
-        run: |
-          set -e
-          echo "github_upload=disabled" >> /tmp/final_dump/_dump_info.txt
-          echo "Skipping GitHub branch upload by user choice."
+        if: inputs.upload_github_branch != 'true'
+        run: echo "GitHub branch upload is disabled. Skipping."
 
       - name: Mirror to GitLab
         if: inputs.upload_gitlab == 'true'
@@ -316,47 +273,93 @@ jobs:
           GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
           GITLAB_USERNAME: ${{ secrets.GITLAB_USERNAME }}
           GITLAB_REPO: ${{ secrets.GITLAB_REPO }}
+          GITLAB_PROJECT_PATH: ${{ secrets.GITLAB_PROJECT_PATH }}
+          GITLAB_REPO_URL: ${{ secrets.GITLAB_REPO_URL }}
         run: |
           set -e
-          [ -z "$GITLAB_TOKEN" ] && echo "GITLAB_TOKEN not set, skipping." && exit 0
-          [ -z "$GITLAB_USERNAME" ] && echo "GITLAB_USERNAME not set, skipping." && exit 0
-          [ -z "$GITLAB_REPO" ] && echo "GITLAB_REPO not set, skipping." && exit 0
 
-          USER_RAW="${GITLAB_USERNAME#@}"
-          if echo "$GITLAB_REPO" | grep -q '/'; then
-            REPO_PATH="$GITLAB_REPO"
-          else
-            REPO_PATH="$USER_RAW/$GITLAB_REPO"
-          fi
+          GL_TOKEN="${GITLAB_TOKEN:-}"
+          GL_USER="${GITLAB_USERNAME:-}"
+          GL_REPO="${GITLAB_REPO:-}"
+          GL_PROJECT_PATH="${GITLAB_PROJECT_PATH:-}"
+          GL_REPO_URL="${GITLAB_REPO_URL:-}"
 
-          ENC_USER=$(python3 -c "import urllib.parse,os; print(urllib.parse.quote(os.environ['USER_RAW'], safe=''))")
-          ENC_TOKEN=$(python3 -c "import urllib.parse,os; print(urllib.parse.quote(os.environ['GITLAB_TOKEN'], safe=''))")
-          REMOTE="https://${ENC_USER}:${ENC_TOKEN}@gitlab.com/${REPO_PATH}.git"
+          [ -n "$GL_TOKEN" ] || { echo "ERROR: Missing secret GITLAB_TOKEN"; exit 1; }
 
-          rm -rf /tmp/gl_push
-          mkdir -p /tmp/gl_push
-          rsync -a /tmp/final_dump/ /tmp/gl_push/
-          cd /tmp/gl_push
-
-          git init -b "${{ steps.branch.outputs.target_branch }}"
-          git config user.email "action@github.com"
-          git config user.name "GitHub Action"
-          git lfs install
-
-          find . -type f -size +50M ! -path './.git/*' -print0 | while IFS= read -r -d '' f; do
-            ext="${f##*.}"
-            git lfs track "*.$ext" 2>/dev/null || true
+          # Guard against placeholder values like ${GL_USER} accidentally stored in Secrets.
+          for v in "$GL_USER" "$GL_REPO" "$GL_PROJECT_PATH" "$GL_REPO_URL"; do
+            case "$v" in
+              *'${'*|*'}'*|*'$%'* )
+                echo "ERROR: Found placeholder-like text in GitLab secrets."
+                echo "Set real values only, e.g. mkpromvp or mkpromvp/Stock_room_dumb"
+                exit 1
+                ;;
+            esac
           done
 
-          git add -A
-          git commit -m "dump: ${{ steps.branch.outputs.target_branch }} [auto]" || echo "Nothing to commit"
-          git remote add origin "$REMOTE"
-          git push --force origin "${{ steps.branch.outputs.target_branch }}" || {
-            echo "WARNING: GitLab push failed. Continuing."
-            exit 0
+          if [ -n "$GL_REPO_URL" ]; then
+            REPO_URL="$GL_REPO_URL"
+          elif [ -n "$GL_PROJECT_PATH" ]; then
+            REPO_URL="https://gitlab.com/${GL_PROJECT_PATH}.git"
+          else
+            [ -n "$GL_USER" ] || { echo "ERROR: Missing secret GITLAB_USERNAME"; exit 1; }
+            [ -n "$GL_REPO" ] || { echo "ERROR: Missing secret GITLAB_REPO"; exit 1; }
+            REPO_URL="https://gitlab.com/${GL_USER}/${GL_REPO}.git"
+          fi
+
+          REPO_URL="${REPO_URL%/}"
+          REPO_URL="${REPO_URL// /}"
+          case "$REPO_URL" in
+            *.git) ;;
+            *) REPO_URL="${REPO_URL}.git" ;;
+          esac
+
+          case "$REPO_URL" in
+            https://gitlab.com/*) ;;
+            *)
+              echo "ERROR: Invalid GitLab URL: $REPO_URL"
+              echo "Use: https://gitlab.com/<owner-or-group>/<repo>.git"
+              exit 1
+              ;;
+          esac
+
+          AUTH_REMOTE="${REPO_URL/https:\/\//https:\/\/oauth2:${GL_TOKEN}@}"
+          BRANCH="${{ steps.branch.outputs.target_branch }}"
+
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          rm -rf /tmp/gitlab_push
+          mkdir -p /tmp/gitlab_push
+          rsync -a /tmp/final_dump/ /tmp/gitlab_push/
+          cd /tmp/gitlab_push
+
+          git init
+          git checkout -B "$BRANCH"
+          git remote add origin "$AUTH_REMOTE"
+
+          # Validate auth and repository path before committing big data.
+          git ls-remote origin >/dev/null 2>&1 || {
+            echo "ERROR: GitLab auth/repo check failed (403 غالبا token scope أو repo path غلط)."
+            echo "Expected repo URL: $REPO_URL"
+            echo "Required token scope: write_repository"
+            exit 1
           }
 
-          echo "gitlab_upload=success" >> /tmp/final_dump/_dump_info.txt
+          find . -type f -name '*.apk' -size +100M -delete 2>/dev/null || true
+          git add -A
+          git commit -m "dump: $BRANCH [$(date -u '+%Y-%m-%d %H:%M UTC')]" || echo "Nothing new to commit"
+
+          ok=false
+          for i in 1 2 3; do
+            if git push origin "$BRANCH" --force; then
+              ok=true
+              break
+            fi
+            echo "GitLab push attempt $i failed."
+            sleep 5
+          done
+          [ "$ok" = true ] || { echo "ERROR: GitLab upload failed after retries"; exit 1; }
 
       - name: Mirror to Gitea / Codeberg
         if: inputs.upload_gitea == 'true'
@@ -367,49 +370,33 @@ jobs:
           GITEA_URL: ${{ secrets.GITEA_URL }}
         run: |
           set -e
-          [ -z "$GITEA_TOKEN" ] && echo "GITEA_TOKEN not set, skipping." && exit 0
-          [ -z "$GITEA_USERNAME" ] && echo "GITEA_USERNAME not set, skipping." && exit 0
-          [ -z "$GITEA_REPO" ] && echo "GITEA_REPO not set, skipping." && exit 0
 
-          USER_RAW="${GITEA_USERNAME#@}"
-          BASE_URL="${GITEA_URL:-https://codeberg.org}"
-          BASE_URL="${BASE_URL%/}"
+          GT_TOKEN="${GITEA_TOKEN:-}"
+          GT_USER="${GITEA_USERNAME:-}"
+          GT_REPO="${GITEA_REPO:-}"
+          GT_URL="${GITEA_URL:-}"
 
-          if echo "$GITEA_REPO" | grep -q '/'; then
-            REPO_PATH="$GITEA_REPO"
-          else
-            REPO_PATH="$USER_RAW/$GITEA_REPO"
-          fi
+          [ -n "$GT_TOKEN" ] || { echo "ERROR: Missing GITEA_TOKEN"; exit 1; }
+          [ -n "$GT_USER" ] || { echo "ERROR: Missing GITEA_USERNAME"; exit 1; }
+          [ -n "$GT_REPO" ] || { echo "ERROR: Missing GITEA_REPO"; exit 1; }
+          [ -n "$GT_URL" ] || { echo "ERROR: Missing GITEA_URL"; exit 1; }
 
-          BASE_HOST="${BASE_URL#*://}"
-          ENC_USER=$(python3 -c "import urllib.parse,os; print(urllib.parse.quote(os.environ['USER_RAW'], safe=''))")
-          ENC_TOKEN=$(python3 -c "import urllib.parse,os; print(urllib.parse.quote(os.environ['GITEA_TOKEN'], safe=''))")
-          AUTH_REMOTE="https://${ENC_USER}:${ENC_TOKEN}@${BASE_HOST}/${REPO_PATH}.git"
+          BRANCH="${{ steps.branch.outputs.target_branch }}"
+          REMOTE="${GT_URL%/}/${GT_USER}/${GT_REPO}.git"
+          AUTH_REMOTE="${REMOTE/https:\/\//https:\/\/${GT_USER}:${GT_TOKEN}@}"
 
-          rm -rf /tmp/gt_push
-          mkdir -p /tmp/gt_push
-          rsync -a /tmp/final_dump/ /tmp/gt_push/
-          cd /tmp/gt_push
+          rm -rf /tmp/gitea_push
+          mkdir -p /tmp/gitea_push
+          rsync -a /tmp/final_dump/ /tmp/gitea_push/
+          cd /tmp/gitea_push
 
-          git init -b "${{ steps.branch.outputs.target_branch }}"
-          git config user.email "action@github.com"
-          git config user.name "GitHub Action"
-          git lfs install
-
-          find . -type f -size +50M ! -path './.git/*' -print0 | while IFS= read -r -d '' f; do
-            ext="${f##*.}"
-            git lfs track "*.$ext" 2>/dev/null || true
-          done
-
-          git add -A
-          git commit -m "dump: ${{ steps.branch.outputs.target_branch }} [auto]" || echo "Nothing to commit"
+          git init
+          git checkout -B "$BRANCH"
           git remote add origin "$AUTH_REMOTE"
-          git push --force origin "${{ steps.branch.outputs.target_branch }}" || {
-            echo "WARNING: Gitea push failed. Continuing."
-            exit 0
-          }
-
-          echo "gitea_upload=success" >> /tmp/final_dump/_dump_info.txt
+          find . -type f -name '*.apk' -size +100M -delete 2>/dev/null || true
+          git add -A
+          git commit -m "dump: $BRANCH [$(date -u '+%Y-%m-%d %H:%M UTC')]" || echo "Nothing new to commit"
+          git push origin "$BRANCH" --force
 
       - name: Upload to SourceForge (rsync over SSH)
         if: inputs.upload_sourceforge == 'true'
@@ -419,35 +406,20 @@ jobs:
           SF_SSH_KEY: ${{ secrets.SF_SSH_KEY }}
         run: |
           set -e
-          [ -z "$SF_USER" ] && echo "SF_USER not set, skipping." && exit 0
-          [ -z "$SF_PROJECT" ] && echo "SF_PROJECT not set, skipping." && exit 0
-          [ -z "$SF_SSH_KEY" ] && echo "SF_SSH_KEY not set, skipping." && exit 0
 
-          if ! command -v ssh >/dev/null 2>&1; then
-            sudo apt-get update -qq
-            sudo apt-get install -y --no-install-recommends openssh-client
-          fi
+          [ -n "${SF_USER:-}" ] || { echo "ERROR: Missing SF_USER"; exit 1; }
+          [ -n "${SF_PROJECT:-}" ] || { echo "ERROR: Missing SF_PROJECT"; exit 1; }
+          [ -n "${SF_SSH_KEY:-}" ] || { echo "ERROR: Missing SF_SSH_KEY"; exit 1; }
 
-          BRANCH='${{ steps.branch.outputs.target_branch }}'
-
+          BRANCH="${{ steps.branch.outputs.target_branch }}"
           mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          printf '%s\n' "$SF_SSH_KEY" > ~/.ssh/sf_key
+          echo "$SF_SSH_KEY" > ~/.ssh/sf_key
           chmod 600 ~/.ssh/sf_key
           ssh-keyscan -H frs.sourceforge.net >> ~/.ssh/known_hosts 2>/dev/null || true
 
-          SF_PATH="/home/frs/project/${SF_PROJECT}/${BRANCH}/"
-          rsync -avz --progress \
-            -e "ssh -i ~/.ssh/sf_key -o StrictHostKeyChecking=no" \
+          rsync -avz --delete -e "ssh -i ~/.ssh/sf_key -o StrictHostKeyChecking=no" \
             /tmp/final_dump/ \
-            "${SF_USER}@frs.sourceforge.net:${SF_PATH}" || {
-            echo "WARNING: SourceForge upload failed. Continuing."
-            rm -f ~/.ssh/sf_key
-            exit 0
-          }
-
-          rm -f ~/.ssh/sf_key
-          echo "sourceforge_upload=success" >> /tmp/final_dump/_dump_info.txt
+            "${SF_USER}@frs.sourceforge.net:/home/frs/project/${SF_PROJECT}/${BRANCH}/"
 
       - name: Upload to Cloudflare R2 (S3-compatible)
         if: inputs.upload_r2 == 'true'
@@ -458,27 +430,30 @@ jobs:
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
         run: |
           set -e
-          [ -z "$R2_ACCESS_KEY_ID" ] && echo "R2_ACCESS_KEY_ID not set, skipping." && exit 0
-          [ -z "$R2_SECRET_ACCESS_KEY" ] && echo "R2_SECRET_ACCESS_KEY not set, skipping." && exit 0
-          [ -z "$R2_BUCKET" ] && echo "R2_BUCKET not set, skipping." && exit 0
-          [ -z "$R2_ENDPOINT" ] && echo "R2_ENDPOINT not set, skipping." && exit 0
+
+          [ -n "${R2_ACCESS_KEY_ID:-}" ] || { echo "ERROR: Missing R2_ACCESS_KEY_ID"; exit 1; }
+          [ -n "${R2_SECRET_ACCESS_KEY:-}" ] || { echo "ERROR: Missing R2_SECRET_ACCESS_KEY"; exit 1; }
+          [ -n "${R2_BUCKET:-}" ] || { echo "ERROR: Missing R2_BUCKET"; exit 1; }
+          [ -n "${R2_ENDPOINT:-}" ] || { echo "ERROR: Missing R2_ENDPOINT"; exit 1; }
+
+          BRANCH="${{ steps.branch.outputs.target_branch }}"
 
           if ! command -v aws >/dev/null 2>&1; then
-            python3 -m pip install --user --quiet awscli
-            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-            export PATH="$HOME/.local/bin:$PATH"
+            pip3 install awscli --quiet
           fi
 
-          BRANCH='${{ steps.branch.outputs.target_branch }}'
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+          export AWS_DEFAULT_REGION="auto"
 
-          AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" \
-          AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" \
           aws s3 sync /tmp/final_dump/ "s3://${R2_BUCKET}/${BRANCH}/" \
             --endpoint-url "$R2_ENDPOINT" \
-            --no-progress \
-            --only-show-errors || {
-            echo "WARNING: R2 upload failed. Continuing."
-            exit 0
-          }
+            --no-progress
 
-          echo "r2_upload=success" >> /tmp/final_dump/_dump_info.txt
+      - name: Complete job
+        run: |
+          echo "=============================="
+          echo "Dump job finished successfully"
+          echo "=============================="
+          echo "Branch: ${{ steps.branch.outputs.target_branch }}"
+          echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
