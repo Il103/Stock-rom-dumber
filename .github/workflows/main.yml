@@ -181,15 +181,38 @@ jobs:
           esac
 
           payload=""
-          if grep -aq "CrAU" input.bin; then
+          magic="$(xxd -p -l 4 input.bin 2>/dev/null || true)"
+          if [ "$magic" = "43724155" ]; then
             payload="/tmp/payload_work/input.bin"
           else
             mkdir -p /tmp/payload_work/unpack
             7z x -y input.bin -o/tmp/payload_work/unpack >/tmp/payload_work/unpack.log 2>&1 || true
             payload="$(find /tmp/payload_work/unpack -type f -iname 'payload.bin' | head -n1 || true)"
+
+            # Some packages store payload as payload.bin.gz.
+            if [ -z "$payload" ]; then
+              payload_gz="$(find /tmp/payload_work/unpack -type f -iname 'payload.bin.gz' | head -n1 || true)"
+              if [ -n "$payload_gz" ]; then
+                gzip -dc "$payload_gz" > /tmp/payload_work/payload.bin
+                payload="/tmp/payload_work/payload.bin"
+              fi
+            fi
           fi
 
-          [ -n "$payload" ] || { echo "ERROR: payload.bin not found"; exit 1; }
+          if [ -z "$payload" ]; then
+            echo "payload.bin not found, fallback to raw partition extraction from archive contents."
+            find /tmp/payload_work/unpack -type f \( \
+              -iname '*.img' -o -iname '*.bin' -o -iname '*.mbn' -o -iname '*.elf' -o \
+              -iname 'super.img*' -o -iname '*scatter*.txt' \
+            \) -print0 | while IFS= read -r -d '' f; do
+              cp -f "$f" /tmp/tool_out/ 2>/dev/null || true
+            done
+
+            raw_count="$(find /tmp/tool_out -type f \( -iname '*.img' -o -iname '*.bin' -o -iname '*.mbn' -o -iname 'super.img*' \) | wc -l)"
+            [ "$raw_count" -gt 0 ] || { echo "ERROR: payload-dumper-go mode: no payload.bin and no raw partition files found"; exit 1; }
+            echo "Raw partition fallback extracted $raw_count files."
+            exit 0
+          fi
 
           if ! command -v go >/dev/null 2>&1; then
             sudo apt-get update -qq
