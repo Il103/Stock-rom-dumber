@@ -1,0 +1,6 @@
+rom_url=https://cold-na-lax-1.gofile.io/download/web/306cd872-ef86-4fd6-b112-fca213b39bc5/SAMFW.COM_SM-A346E_EGY_A346EXXUEFZE6_fac.zip
+target_branch_input=auto
+device_name_input=SM-A346E
+workflow_run=https://github.com/Il103/Stock-rom-dumber/actions/runs/28251872263
+dumped_at=2026-06-26 16:42:12 UTC
+target_branch_resolved=dump-stock-sm-a346e

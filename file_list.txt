@@ -1,0 +1,4 @@
+./_dump_info.txt
+./board-info.txt
+./file_list.txt
+./tmp/board-info.txt
