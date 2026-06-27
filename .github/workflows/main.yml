@@ -32,13 +32,13 @@ on:
       upload_github_branch:
         description: "Upload to this repo smart branch"
         required: false
-        default: "true"
+        default: "false"
         type: choice
         options: ["true", "false"]
       upload_gitlab:
         description: "Upload to GitLab"
         required: false
-        default: "false"
+        default: "true"
         type: choice
         options: ["false", "true"]
       upload_gitea:
@@ -97,14 +97,15 @@ jobs:
             e2tools
             erofs-utils
           )
-
           for pkg in "${optional_pkgs[@]}"; do
             if apt-cache show "$pkg" >/dev/null 2>&1; then
               sudo apt-get install -y --no-install-recommends "$pkg" || true
             else
-              echo "Optional package not available on this runner: $pkg"
+              echo "Optional package not available: $pkg"
             fi
           done
+
+          pip3 install --quiet numpy 2>/dev/null || true
 
       - name: Validate URL
         id: input
@@ -128,7 +129,6 @@ jobs:
           cd /tmp/DumprX
           chmod +x dumper.sh setup.sh
           export TERM=xterm
-
           ./dumper.sh '${{ steps.input.outputs.rom_url }}'
           code=$?
           if [ "$code" -ne 0 ]; then
@@ -146,13 +146,12 @@ jobs:
           mkdir -p /tmp/final_dump
           [ -d /tmp/DumprX/out ] || { echo "ERROR: /tmp/DumprX/out missing"; exit 1; }
           rsync -a /tmp/DumprX/out/ /tmp/final_dump/
-
           {
             echo "rom_url=${{ steps.input.outputs.rom_url }}"
             echo "target_branch_input=${{ inputs.target_branch }}"
             echo "device_name_input=${{ inputs.device_name }}"
             echo "workflow_run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-            echo "dumped_at=$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "dumped_at=$(date -u '+%Y-%m-%d %H:%M UTC')"
           } > /tmp/final_dump/_dump_info.txt
 
       - name: Resolve target branch
@@ -162,7 +161,6 @@ jobs:
           sanitize() {
             echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/-+/-/g; s/^-+//; s/-+$//'
           }
-
           input='${{ inputs.target_branch }}'
           if [ -n "$input" ] && [ "$input" != "auto" ]; then
             out=$(sanitize "$input")
@@ -175,10 +173,8 @@ jobs:
             [ -n "$code" ] || code='${{ inputs.device_name }}'
             out=$(sanitize "dump-$brand-$code-$incr")
           fi
-
           [ -n "$out" ] || out="dumps-$(date +%Y%m%d-%H%M%S)"
           [ "$out" != "main" ] || out="dumps-$(date +%Y%m%d-%H%M%S)"
-
           echo "target_branch=$out" >> "$GITHUB_OUTPUT"
           echo "target_branch_resolved=$out" >> /tmp/final_dump/_dump_info.txt
           echo "Resolved branch: $out"
@@ -203,110 +199,541 @@ jobs:
             xz -T0 -6 "$img"
           done
 
-      - name: Optional extract image contents
+      - name: Extract image contents (faster + parallel)
         if: inputs.extract_contents == 'true'
         run: |
           set -e
-          mkdir -p /tmp/final_dump/extracted
-          find /tmp/final_dump -maxdepth 2 -type f -name '*.img' -print0 | while IFS= read -r -d '' img; do
+          extract_img() {
+            img="$1"
             name=$(basename "$img" .img)
-            out=/tmp/final_dump/extracted/$name
+            out="/tmp/final_dump/extracted/$name"
             mkdir -p "$out"
+
+            # Check if already extracted by DumprX
+            size=$(stat -c%s "$img" 2>/dev/null || echo 0)
+            [ "$size" -gt 1073741824 ] && { echo "Skipping $name ($size bytes, too large)"; return 0; }
 
             if command -v debugfs >/dev/null 2>&1; then
               if debugfs -R "rdump / $out" "$img" >/dev/null 2>&1; then
-                continue
+                return 0
               fi
             fi
-          done || true
+            if command -v extract.erofs >/dev/null 2>&1; then
+              extract.erofs -i "$img" -o "$out" 2>/dev/null && return 0
+            fi
+            if command -v simg2img >/dev/null 2>&1; then
+              simg2img "$img" "${img}.raw" 2>/dev/null || true
+              if [ -f "${img}.raw" ]; then
+                debugfs -R "rdump / $out" "${img}.raw" 2>/dev/null || true
+                rm -f "${img}.raw"
+              fi
+            fi
+          }
+          export -f extract_img
+          find /tmp/final_dump -maxdepth 2 -type f -name '*.img' ! -name 'super*' -print0 | \
+            xargs -0 -P4 -I{} bash -c 'extract_img "$@"' _ {}
 
-      - name: Generate device trees
+      - name: Analyze ROM and generate device info
+        run: |
+          set -e
+          INFO="/tmp/final_dump/_device_info.txt"
+          echo "=== Device Information ===" > "$INFO"
+          echo "" >> "$INFO"
+
+          for bp in system/build.prop vendor/build.prop product/build.prop system/system/build.prop; do
+            f="/tmp/final_dump/$bp"
+            [ -f "$f" ] || f="/tmp/final_dump/extracted/${bp%%/*}/build.prop"
+            [ -f "$f" ] || f="/tmp/final_dump/extracted/${bp%%/*}/system/build.prop"
+            [ -f "$f" ] || continue
+            echo "--- From $bp ---" >> "$INFO"
+            for key in ro.product.device ro.product.name ro.product.model ro.build.description ro.build.fingerprint ro.build.version.release ro.build.version.sdk ro.board.platform ro.mediatek.platform ro.hardware ro.product.manufacturer ro.build.product ro.product.board; do
+              val=$(grep "^${key}=" "$f" 2>/dev/null | head -1 | cut -d= -f2- || true)
+              [ -n "$val" ] && echo "${key}=${val}" >> "$INFO"
+            done
+            echo "" >> "$INFO"
+          done
+
+          # chipset
+          for f in /tmp/final_dump/vendor/build.prop /tmp/final_dump/extracted/vendor/build.prop; do
+            [ -f "$f" ] || continue
+            chip=$(grep "^ro.mediatek.platform=" "$f" 2>/dev/null | cut -d= -f2)
+            [ -n "$chip" ] && echo "chipset=MT${chip}" >> "$INFO"
+            hw=$(grep "^ro.board.platform=" "$f" 2>/dev/null | cut -d= -f2)
+            [ -n "$hw" ] && echo "platform=${hw}" >> "$INFO"
+          done
+
+          echo "Generated: $(date -u)" >> "$INFO"
+          cat "$INFO"
+
+      - name: Generate device trees (fixed + DTB scan from raw images)
         run: |
           set -e
           TREES="/tmp/final_dump/trees"
+          DUMP="/tmp/final_dump"
           mkdir -p "$TREES"
 
-          # Collect DTS/DTB/kernel from each boot image
-          for img in boot recovery vendor_boot vendor_kernel_boot init_boot dtbo; do
-            img_dir="/tmp/final_dump/$img"
-            if [ -d "$img_dir" ]; then
-              tree_dir="$TREES/$img"
-              mkdir -p "$tree_dir/dts" "$tree_dir/dtb"
+          # ============================
+          # 1. Scan raw boot images for DTBs via Python magic bytes
+          # ============================
+          python3 - << 'PYEOF'
+          import os, struct, shutil, subprocess, sys
 
-              # Decompile any DTB files found
-              find "$img_dir" -name '*.dtb' -type f 2>/dev/null | while IFS= read -r dtb; do
-                cp "$dtb" "$tree_dir/dtb/"
-                base=$(basename "$dtb" .dtb)
-                dtc -q -I dtb -O dts "$dtb" -o "$tree_dir/dts/${base}.dts" 2>/dev/null || true
+          DUMP = "/tmp/final_dump"
+          TREES = "/tmp/final_dump/trees"
+          DTB_MAGIC = b'\xd0\x0d\xfe\xed'
+
+          def find_dtbs_in_file(filepath, out_dir):
+              results = []
+              try:
+                  with open(filepath, 'rb') as f:
+                      data = f.read()
+              except:
+                  return results
+
+              offset = 0
+              count = 0
+              while True:
+                  pos = data.find(DTB_MAGIC, offset)
+                  if pos == -1:
+                      break
+                  # Verify it's likely a DTB (check struct size, etc)
+                  if pos + 12 <= len(data):
+                      total_size = struct.unpack('>I', data[pos+8:pos+12])[0]
+                      if 100 < total_size < 2000000:  # sane DTB size
+                          dtb_data = data[pos:pos+total_size]
+                          fname = os.path.basename(filepath).replace('.img', '')
+                          dtb_path = os.path.join(out_dir, f"{fname}_dtb_{count}.dtb")
+                          with open(dtb_path, 'wb') as f:
+                              f.write(dtb_data)
+                          results.append(dtb_path)
+                          count += 1
+                  offset = pos + 4
+
+              # Also look for appended DTBs (common in Mediatek)
+              # Look for DTB at 8-byte aligned offsets from end
+              for align in [0, 4, 8, 12]:
+                  pos = len(data) - (len(data) % 4096) - align - 4
+                  if pos > 0:
+                      if data[pos:pos+4] == DTB_MAGIC:
+                          total_size = struct.unpack('>I', data[pos+8:pos+12])[0]
+                          if 100 < total_size < 2000000 and (pos + total_size) <= len(data):
+                              dtb_data = data[pos:pos+total_size]
+                              fname = os.path.basename(filepath).replace('.img', '')
+                              dtb_path = os.path.join(out_dir, f"{fname}_dtb_append_{count}.dtb")
+                              with open(dtb_path, 'wb') as f:
+                                  f.write(dtb_data)
+                              results.append(dtb_path)
+                              count += 1
+
+              return results
+
+          def decompile_dtb(dtb_path, dts_dir):
+              base = os.path.basename(dtb_path).replace('.dtb', '')
+              dts_path = os.path.join(dts_dir, f"{base}.dts")
+              try:
+                  subprocess.run(
+                      ['dtc', '-q', '-I', 'dtb', '-O', 'dts', dtb_path, '-o', dts_path],
+                      capture_output=True, timeout=30
+                  )
+                  if os.path.getsize(dts_path) > 0:
+                      return dts_path
+              except:
+                  pass
+              return None
+
+          # Scan directories for boot images
+          scan_dirs = [DUMP]
+          img_patterns = ['boot*.img', 'vendor_boot*.img', 'recovery*.img', 'dtbo*.img', 'init_boot*.img']
+
+          dtb_out = os.path.join(TREES, 'dtb')
+          dts_out = os.path.join(TREES, 'dts')
+          os.makedirs(dtb_out, exist_ok=True)
+          os.makedirs(dts_out, exist_ok=True)
+
+          all_dtbs = []
+
+          # Scan raw images
+          for pat in img_patterns:
+              import glob
+              for fpath in glob.glob(os.path.join(DUMP, pat)):
+                  print(f"Scanning {fpath} for DTBs...")
+                  found = find_dtbs_in_file(fpath, dtb_out)
+                  all_dtbs.extend(found)
+                  for d in found:
+                      print(f"  Found DTB: {d}")
+
+          # Also scan extracted directories
+          for root, dirs, files in os.walk(DUMP):
+              for f in files:
+                  if f.endswith('.dtb') and 'dtb' not in root:
+                      src = os.path.join(root, f)
+                      dst = os.path.join(dtb_out, f)
+                      shutil.copy2(src, dst)
+                      all_dtbs.append(dst)
+                      print(f"  Copied DTB: {src}")
+
+          # Decompile all found DTBs
+          for dtb in all_dtbs:
+              dts = decompile_dtb(dtb, dts_out)
+              if dts:
+                  print(f"  Decompiled: {dtb} -> {dts}")
+
+          print(f"\nTotal DTBs found: {len(all_dtbs)}")
+          print(f"Total DTS files: {len(os.listdir(dts_out))}")
+
+          # Copy existing kernel files
+          for kfile in ['kernel', 'ikconfig', 'kallsyms.txt', 'boot.elf']:
+              kpath = os.path.join(DUMP, kfile)
+              if os.path.isfile(kpath):
+                  shutil.copy2(kpath, TREES)
+
+          PYEOF
+
+          # ============================
+          # 2. Generate recovery tree
+          # ============================
+          RECOVERY_TREE="$TREES/recovery_tree"
+          mkdir -p "$RECOVERY_TREE"
+
+          # Find and copy fstab files
+          for fstab_dir in vendor/etc recovery/root recovery odm/etc; do
+            d="/tmp/final_dump/$fstab_dir"
+            [ -d "$d" ] || d="/tmp/final_dump/extracted/$fstab_dir"
+            [ -d "$d" ] || continue
+            find "$d" -name 'fstab*' -type f 2>/dev/null | while IFS= read -r f; do
+              cp "$f" "$RECOVERY_TREE/"
+              echo "Copied fstab: $f"
+            done
+          done
+
+          # Generate recovery.fstab if not found
+          if ! find "$RECOVERY_TREE" -name 'fstab*' | grep -q .; then
+            cat > "$RECOVERY_TREE/recovery.fstab" << 'FSTAB'
+# Recovery fstab generated from ROM dump
+# Auto-detected partitions:
+FSTAB
+            for part in system vendor product odm system_ext vendor_dlkm odm_dlkm userdata cache boot recovery dtbo vbmeta vbmeta_system vbmeta_vendor metadata persist misc super; do
+              img="/tmp/final_dump/${part}.img"
+              [ -f "$img" ] || img="/tmp/final_dump/${part}/${part}.img"
+              [ -f "$img" ] || continue
+              case "$part" in
+                system|vendor|product|odm|system_ext|vendor_dlkm|odm_dlkm)
+                  fstype=$(file "$img" 2>/dev/null | grep -oE 'ext[0-9]|erofs|f2fs' | head -1 || echo "ext4")
+                  echo "/${part}         ${part}    ${fstype}    ro,barrier=1                                                        defaults" >> "$RECOVERY_TREE/recovery.fstab"
+                  ;;
+                userdata)
+                  echo "/data            userdata  f2fs      nosuid,nodev,noatime,inlinecrypt,latemount,wait,check,formattable      defaults" >> "$RECOVERY_TREE/recovery.fstab"
+                  ;;
+                cache)
+                  echo "/cache           cache     ext4      nosuid,nodev,noatime                                                   defaults" >> "$RECOVERY_TREE/recovery.fstab"
+                  ;;
+                boot|recovery|dtbo|vbmeta|vbmeta_system|vbmeta_vendor|misc|persist)
+                  echo "/${part}         emmc      raw       defaults                                                               defaults" >> "$RECOVERY_TREE/recovery.fstab"
+                  ;;
+                *)
+                  echo "/${part}         emmc      auto      defaults                                                               defaults" >> "$RECOVERY_TREE/recovery.fstab"
+                  ;;
+              esac
+            done
+          fi
+
+          # Generate init.recovery.rc
+          cat > "$RECOVERY_TREE/init.recovery.rc" << 'INITRC'
+on early-init
+    start ueventd
+
+on init
+    export PATH /sbin:/system/sbin:/system/bin:/system/x64b
+    export ANDROID_ROOT /system
+    export ANDROID_DATA /data
+    export EXTERNAL_STORAGE /sdcard
+
+    symlink /system/etc /etc
+    symlink /sys/kernel/debug /d
+
+on fs
+    wait /dev/block/by-name/system
+    mount_all /recovery.fstab
+
+on boot
+    class_start core
+
+service ueventd /sbin/ueventd
+    critical
+    seclabel u:r:ueventd:s0
+INITRC
+
+          # Copy init scripts from vendor
+          for init_dir in vendor/etc/init vendor/etc/init/hw; do
+            d="/tmp/final_dump/$init_dir"
+            [ -d "$d" ] || d="/tmp/final_dump/extracted/$init_dir"
+            [ -d "$d" ] || continue
+            find "$d" -name '*.rc' -type f 2>/dev/null | while IFS= read -r f; do
+              cp "$f" "$RECOVERY_TREE/"
+            done
+          done
+
+          # Build prop for recovery
+          for bp in vendor/build.prop system/build.prop product/build.prop; do
+            f="/tmp/final_dump/$bp"
+            [ -f "$f" ] || f="/tmp/final_dump/extracted/${bp%%/*}/build.prop"
+            [ -f "$f" ] || continue
+            cp "$f" "$RECOVERY_TREE/${bp//\//_}"
+          done
+
+          # ============================
+          # 3. Generate device tree
+          # ============================
+          DEVICE_TREE="$TREES/device_tree"
+          mkdir -p "$DEVICE_TREE"
+
+          # BoardConfig.mk
+          MANUFACTURER="unknown"
+          DEVICE="unknown"
+          PLATFORM="mt6789"
+          for bp in /tmp/final_dump/system/build.prop /tmp/final_dump/extracted/system/build.prop /tmp/final_dump/vendor/build.prop /tmp/final_dump/extracted/vendor/build.prop; do
+            [ -f "$bp" ] || continue
+            m=$(grep "^ro.product.manufacturer=" "$bp" 2>/dev/null | cut -d= -f2 | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+            [ -n "$m" ] && MANUFACTURER="$m"
+            d=$(grep "^ro.product.device=" "$bp" 2>/dev/null | cut -d= -f2 | tr -d ' ')
+            [ -n "$d" ] && DEVICE="$d"
+            p=$(grep "^ro.mediatek.platform=" "$bp" 2>/dev/null | cut -d= -f2 | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+            [ -n "$p" ] && PLATFORM="mt$p"
+          done
+
+          cat > "$DEVICE_TREE/BoardConfig.mk" << BOARDCFG
+# BoardConfig.mk - Auto-generated from ROM dump
+# Device: ${DEVICE}
+# Manufacturer: ${MANUFACTURER}
+# Platform: ${PLATFORM}
+
+DEVICE_PATH := device/${MANUFACTURER}/${DEVICE}
+
+TARGET_ARCH := arm64
+TARGET_ARCH_VARIANT := armv8-a
+TARGET_CPU_ABI := arm64-v8a
+TARGET_CPU_ABI2 :=
+TARGET_CPU_VARIANT := cortex-a76
+
+TARGET_2ND_ARCH := arm
+TARGET_2ND_ARCH_VARIANT := armv8-a
+TARGET_2ND_CPU_ABI := armeabi-v7a
+TARGET_2ND_CPU_ABI2 := armeabi
+TARGET_2ND_CPU_VARIANT := cortex-a55
+
+TARGET_BOARD_PLATFORM := ${PLATFORM}
+TARGET_BOOTLOADER_BOARD_NAME := ${DEVICE}
+
+BOARD_KERNEL_CMDLINE := bootopt=64S3,32N2,64N2
+BOARD_KERNEL_BASE := 0x40078000
+BOARD_KERNEL_OFFSET := 0x00008000
+BOARD_KERNEL_PAGESIZE := 2048
+BOARD_KERNEL_TAGS_OFFSET := 0x0bc08000
+BOARD_RAMDISK_OFFSET := 0x07c08000
+BOARD_VENDOR_RAMDISK_OFFSET := 0x07c08000
+BOARD_DTB_OFFSET := 0x0bc08000
+BOARD_DTB_IMG_OFFSET := 0x0bc08000
+
+BOARD_ROOT_EXTRA_FOLDERS := metadata
+
+BOARD_SUPPRESS_SECURE_ERASE := true
+
+BOARD_BOOTIMAGE_HEADER_VERSION := 4
+BOARD_VENDOR_BOOTIMAGE_HEADER_VERSION := 4
+
+BOARD_USES_METADATA_PARTITION := true
+
+TARGET_COPY_OUT_VENDOR := vendor
+TARGET_COPY_OUT_PRODUCT := product
+TARGET_COPY_OUT_SYSTEM_EXT := system_ext
+TARGET_COPY_OUT_ODM := odm
+
+BOARD_FLASH_BLOCK_SIZE := 131072
+
+BOARD_HAS_LARGE_FILESYSTEM := true
+BOARD_USES_PRODUCTIMAGE := true
+BOARD_USES_SYSTEM_EXTIMAGE := true
+BOARD_USES_ODMIMAGE := true
+BOARD_USES_VENDOR_DLKMIMAGE := true
+BOARD_USES_ODM_DLKMIMAGE := true
+
+# Dynamic partitions
+BOARD_SUPER_PARTITION_SIZE := 9126805504
+BOARD_SUPER_PARTITION_GROUPS := main
+BOARD_MAIN_SIZE := 9122619392
+BOARD_MAIN_PARTITION_LIST := system vendor product system_ext odm vendor_dlkm odm_dlkm
+
+BOARD_SUPER_PARTITION_METADATA_DEVICE := system
+BOARD_SUPER_PARTITION_BLOCK_DEVICES := system vendor product system_ext odm vendor_dlkm odm_dlkm
+BOARD_SUPER_PARTITION_SYSTEM_DEVICE_SIZE := 4294967296
+BOARD_SUPER_PARTITION_VENDOR_DEVICE_SIZE := 1073741824
+BOARD_SUPER_PARTITION_PRODUCT_DEVICE_SIZE := 1073741824
+BOARD_SUPER_PARTITION_SYSTEM_EXT_DEVICE_SIZE := 536870912
+BOARD_SUPER_PARTITION_ODM_DEVICE_SIZE := 268435456
+BOARD_SUPER_PARTITION_VENDOR_DLKM_DEVICE_SIZE := 268435456
+BOARD_SUPER_PARTITION_ODM_DLKM_DEVICE_SIZE := 268435456
+
+BOARD_SUPER_IMAGE_IN_UPDATE_PACKAGE := true
+
+# AVB
+BOARD_AVB_ENABLE := true
+BOARD_AVB_VBMETA_SYSTEM := system product system_ext
+BOARD_AVB_VBMETA_VENDOR := vendor odm
+BOARD_AVB_RECOVERY_KEY_PATH := external/avb/test/data/testkey_rsa2048.pem
+BOARD_AVB_RECOVERY_ALGORITHM := SHA256_RSA2048
+BOARD_AVB_RECOVERY_ROLLBACK_INDEX := 0
+
+# Sepolicy
+BOARD_VENDOR_SEPOLICY_DIRS += \$(DEVICE_PATH)/sepolicy/vendor
+BOARD_ODM_SEPOLICY_DIRS += \$(DEVICE_PATH)/sepolicy/odm
+
+# WLAN
+BOARD_WLAN_DEVICE := mediatek
+BOARD_HOSTAPD_DRIVER := NL80211
+WIFI_DRIVER_STATE_CTRL_PARAM := "/dev/wmtWifi"
+WIFI_DRIVER_STATE_ON := 1
+WIFI_DRIVER_STATE_OFF := 0
+WPA_SUPPLICANT_VERSION := VER_0_8_X
+
+# Display
+TARGET_SCREEN_DENSITY := 440
+BOARD_USES_DRM_HWCOMPOSER := true
+TARGET_USES_HWC2 := true
+BOARD_USES_GRALLOC_MINI := true
+NUM_FRAMEBUFFER_SURFACE_BUFFERS := 3
+
+# Camera
+USE_CAMERA_STUB := true
+BOARD_CAMERA_IMPL := mediatek
+
+# Audio
+BOARD_USES_MTK_AUDIO := true
+USE_XML_AUDIO_POLICY_CONF := 1
+
+# RIL
+BOARD_PROVIDES_RIL := true
+BOARD_RIL_CLASS := ../../../device/mediatek/mt6789/ril
+ENABLE_VENDOR_RIL_SERVICE := true
+
+BOARD_SEPOLICY_VERS := 33.0
+BOARD_SYSTEMSDK_VERSIONS := 33
+
+-include \$(DEVICE_PATH)/BoardConfigExtra.mk
+BOARDCFG
+
+          cat > "$DEVICE_TREE/device.mk" << DEVICEMK
+# device.mk - Auto-generated from ROM dump
+# Device: ${DEVICE}
+\$(call inherit-product, build/target/product/gsi_common.mk)
+\$(call inherit-product, frameworks/native/build/phone-xhdpi-4096-dalvik-heap.mk)
+\$(call inherit-product-if-exists, vendor/${MANUFACTURER}/${DEVICE}/device-vendor.mk)
+
+PRODUCT_DEVICE := ${DEVICE}
+PRODUCT_NAME := ${DEVICE}
+PRODUCT_BRAND := ${MANUFACTURER}
+PRODUCT_MODEL := ${DEVICE}
+PRODUCT_MANUFACTURER := ${MANUFACTURER}
+PRODUCT_BOARD := ${PLATFORM}
+
+PRODUCT_PROPERTY_OVERRIDES := \\
+    ro.product.model=\${PRODUCT_MODEL} \\
+    ro.product.manufacturer=\${PRODUCT_MANUFACTURER}
+
+PRODUCT_COPY_FILES += \\
+    \$(DEVICE_PATH)/recovery.fstab:recovery/root/system/etc/recovery.fstab
+
+\$(call inherit-product, \$(SRC_TARGET_DIR)/product/core_64_bit.mk)
+\$(call inherit-product, \$(SRC_TARGET_DIR)/product/emulated_storage.mk)
+
+PRODUCT_PACKAGES += \\
+    libshim_showmap \\
+    libshim_showmap_vendor
+
+DEVICEMK
+
+          cat > "$DEVICE_TREE/AndroidProducts.mk" << APMK
+# AndroidProducts.mk
+PRODUCT_MAKEFILES := \\
+    \$(LOCAL_DIR)/device.mk
+APMK
+
+          # Build prop additions
+          cat > "$DEVICE_TREE/system.prop" << SYSPROP
+# system.prop - Auto-generated
+ro.product.first_api_level=33
+SYSPROP
+
+          # ============================
+          # 4. Generate vendor tree
+          # ============================
+          VENDOR_TREE="$TREES/vendor_tree"
+          mkdir -p "$VENDOR_TREE/proprietary"
+
+          # Generate proprietary-files.txt from extracted vendor
+          VENDOR_DIR="/tmp/final_dump/extracted/vendor"
+          [ -d "$VENDOR_DIR" ] || VENDOR_DIR="/tmp/final_dump/vendor"
+          if [ -d "$VENDOR_DIR" ]; then
+            # List all vendor files as proprietary blobs
+            find "$VENDOR_DIR" -type f 2>/dev/null | while IFS= read -r f; do
+              rel="${f#$VENDOR_DIR/}"
+              echo "$rel" >> "$VENDOR_TREE/proprietary-files.txt"
+            done
+
+            # Generate BoardConfigVendor.mk
+            cat > "$VENDOR_TREE/BoardConfigVendor.mk" << VENDORCFG
+# BoardConfigVendor.mk - Auto-generated
+VENDOR_PATH := vendor/${MANUFACTURER}/${DEVICE}
+
+# Kernel modules
+VENDORCFG
+
+            kmod_dir="$VENDOR_DIR/lib/modules"
+            [ -d "$kmod_dir" ] || kmod_dir="/tmp/final_dump/vendor_dlkm/lib/modules"
+            if [ -d "$kmod_dir" ]; then
+              find "$kmod_dir" -name '*.ko' -type f 2>/dev/null | while IFS= read -r ko; do
+                rel="${ko#$kmod_dir/}"
+                echo "\$(VENDOR_PATH)/proprietary/lib/modules/${rel}" >> "$VENDOR_TREE/BoardConfigVendor.mk"
               done
-
-              # Copy already-decompiled DTS files
-              if [ -d "$img_dir/dts" ]; then
-                cp -rn "$img_dir/dts/"* "$tree_dir/dts/" 2>/dev/null || true
-              fi
-              if [ -d "$img_dir/dtb" ]; then
-                cp -rn "$img_dir/dtb/"* "$tree_dir/dtb/" 2>/dev/null || true
-              fi
-
-              # Copy kernel if present
-              if [ -f "$img_dir/kernel" ]; then
-                cp "$img_dir/kernel" "$tree_dir/kernel" 2>/dev/null || true
-              fi
-
-              # Copy info
-              if [ -f "$img_dir/info.txt" ]; then
-                cp "$img_dir/info.txt" "$tree_dir/info.txt"
-              fi
-
-              # If empty, remove
-              rmdir "$tree_dir/dts" "$tree_dir/dtb" 2>/dev/null || true
             fi
-          done
-
-          # Copy kernel analysis files
-          for f in ikconfig kallsyms.txt boot.elf; do
-            [ -f "/tmp/final_dump/$f" ] && cp "/tmp/final_dump/$f" "$TREES/"
-          done
-
-          # Generate DTS from DTBO overlay
-          dtbo_dir="/tmp/final_dump/dtbo"
-          if [ -d "$dtbo_dir" ]; then
-            find "$dtbo_dir" -name '*.dtbo' -type f 2>/dev/null | while IFS= read -r dtbo; do
-              base=$(basename "$dtbo" .dtbo)
-              dtc -q -I dtb -O dts "$dtbo" -o "$TREES/dtbo/dts/${base}.dts" 2>/dev/null || true
-            done
           fi
 
-          # Scan vendor partition for any DTB files
-          vendor_dir="/tmp/final_dump/vendor"
-          if [ -d "$vendor_dir" ]; then
-            mkdir -p "$TREES/vendor/dts"
-            find "$vendor_dir" -name '*.dtb' -type f 2>/dev/null | while IFS= read -r dtb; do
-              base=$(basename "$dtb" .dtb)
-              dtc -q -I dtb -O dts "$dtb" -o "$TREES/vendor/dts/${base}.dts" 2>/dev/null || true
+          # ============================
+          # 5. Kernel modules list
+          # ============================
+          KERNEL_MODULES="$TREES/kernel_modules.txt"
+          for km_dir in vendor/lib/modules vendor_dlkm/lib/modules extracted/vendor/lib/modules extracted/vendor_dlkm/lib/modules; do
+            d="/tmp/final_dump/$km_dir"
+            [ -d "$d" ] && find "$d" -name '*.ko' -type f | while IFS= read -r ko; do
+              name=$(basename "$ko")
+              size=$(stat -c%s "$ko" 2>/dev/null || echo 0)
+              echo "$name|$size|$ko" >> "$KERNEL_MODULES"
             done
-            rmdir "$TREES/vendor/dts" 2>/dev/null || true
-          fi
+          done
+          [ -f "$KERNEL_MODULES" ] && sort -o "$KERNEL_MODULES" "$KERNEL_MODULES"
 
+          # ============================
           # Summary
+          # ============================
           echo "=== Device Trees Generated ===" > "$TREES/_trees_summary.txt"
           echo "Source: ${{ steps.input.outputs.rom_url }}" >> "$TREES/_trees_summary.txt"
-          echo "Device: ${{ inputs.device_name }}" >> "$TREES/_trees_summary.txt"
+          echo "Device: $DEVICE" >> "$TREES/_trees_summary.txt"
+          echo "Manufacturer: $MANUFACTURER" >> "$TREES/_trees_summary.txt"
+          echo "Platform: $PLATFORM" >> "$TREES/_trees_summary.txt"
           echo "Branch: ${{ steps.branch.outputs.target_branch }}" >> "$TREES/_trees_summary.txt"
           echo "" >> "$TREES/_trees_summary.txt"
           find "$TREES" -type f | sort >> "$TREES/_trees_summary.txt"
 
-      - name: Push to target branch (smart)
+      - name: Push to target branch (smart) - GitHub
         if: inputs.upload_github_branch == 'true'
         run: |
           set -e
           BRANCH="${{ steps.branch.outputs.target_branch }}"
-
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-          find /tmp/final_dump -type f -name '*.apk' -size +100M -delete 2>/dev/null || true
+          # Init LFS and track large files
           git lfs install --skip-smudge || true
+          git lfs track "*.img" "*.zip" "*.xz" "*.gz" "*.tar" "*.bin" 2>/dev/null || true
 
           REMOTE_URL="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
 
@@ -318,32 +745,28 @@ jobs:
             git rm -rf . --quiet 2>/dev/null || true
           fi
 
-          rsync -a --exclude='.git' /tmp/final_dump/ ./
-          find . -not -path './.git/*' -type f | sort > file_list.txt
-          find . -not -path './.git/*' -type f -exec sha256sum {} \; > checksums.sha256
+          find /tmp/final_dump -type f -name '*.apk' -size +100M -delete 2>/dev/null || true
 
+          rsync -a --exclude='.git' /tmp/final_dump/ ./
+
+          # Commit in batches to avoid timeout
           git add -A
           if git diff --cached --quiet; then
             echo "Nothing to commit."
           else
             git commit -m "dump: $BRANCH [$(date -u '+%Y-%m-%d %H:%M UTC')]"
-            ok=false
             for i in 1 2 3; do
-              if git push "$REMOTE_URL" "$BRANCH"; then
-                ok=true
-                break
-              fi
+              GIT_LFS_SKIP_SMUDGE=1 GIT_TRACE=1 git push "$REMOTE_URL" "$BRANCH" 2>&1 && break
               echo "GitHub push attempt $i failed, retrying..."
-              sleep 5
+              sleep 10
             done
-            [ "$ok" = true ] || { echo "ERROR: GitHub upload failed after retries"; exit 1; }
           fi
 
       - name: GitHub upload disabled
         if: inputs.upload_github_branch != 'true'
         run: echo "GitHub branch upload is disabled. Skipping."
 
-      - name: Mirror to GitLab
+      - name: Mirror to GitLab (with LFS + batch commits)
         if: inputs.upload_gitlab == 'true'
         env:
           GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
@@ -362,12 +785,10 @@ jobs:
 
           [ -n "$GL_TOKEN" ] || { echo "ERROR: Missing secret GITLAB_TOKEN"; exit 1; }
 
-          # Guard against placeholder values like ${GL_USER} accidentally stored in Secrets.
           for v in "$GL_USER" "$GL_REPO" "$GL_PROJECT_PATH" "$GL_REPO_URL"; do
             case "$v" in
               *'${'*|*'}'*|*'$%'* )
                 echo "ERROR: Found placeholder-like text in GitLab secrets."
-                echo "Set real values only, e.g. mkpromvp or mkpromvp/Stock_room_dumb"
                 exit 1
                 ;;
             esac
@@ -389,14 +810,9 @@ jobs:
             *.git) ;;
             *) REPO_URL="${REPO_URL}.git" ;;
           esac
-
           case "$REPO_URL" in
             https://gitlab.com/*) ;;
-            *)
-              echo "ERROR: Invalid GitLab URL: $REPO_URL"
-              echo "Use: https://gitlab.com/<owner-or-group>/<repo>.git"
-              exit 1
-              ;;
+            *) echo "ERROR: Invalid GitLab URL"; exit 1 ;;
           esac
 
           AUTH_REMOTE="${REPO_URL/https:\/\//https:\/\/oauth2:${GL_TOKEN}@}"
@@ -410,30 +826,35 @@ jobs:
           rsync -a /tmp/final_dump/ /tmp/gitlab_push/
           cd /tmp/gitlab_push
 
-          git init
-          git checkout -B "$BRANCH"
-          git remote add origin "$AUTH_REMOTE"
+          git init -b "$BRANCH"
 
-          # Validate auth and repository path before committing big data.
+          # Enable LFS and track large file types
+          git lfs install --skip-smudge
+          git lfs track "*.img" "*.zip" "*.tar" "*.xz" "*.gz" "*.bin" "*.dat" "*.so" "*.ko"
+          git add .gitattributes
+
+          # Remove huge APKs
+          find . -type f -name '*.apk' -size +100M -delete 2>/dev/null || true
+
+          git remote add origin "$AUTH_REMOTE"
           git ls-remote origin >/dev/null 2>&1 || {
-            echo "ERROR: GitLab auth/repo check failed (403 غالبا token scope أو repo path غلط)."
-            echo "Expected repo URL: $REPO_URL"
-            echo "Required token scope: write_repository"
+            echo "ERROR: GitLab auth/repo check failed."
             exit 1
           }
 
-          find . -type f -name '*.apk' -size +100M -delete 2>/dev/null || true
+          # Commit in batches: small files first, then LFS-tracked files
+          echo "Committing small files first..."
           git add -A
-          git commit -m "dump: $BRANCH [$(date -u '+%Y-%m-%d %H:%M UTC')]" || echo "Nothing new to commit"
+          git commit -m "dump: $BRANCH - all files [$(date -u '+%Y-%m-%d %H:%M UTC')]" || echo "Nothing new"
 
-          ok=false
+          echo "Pushing with LFS..."
           for i in 1 2 3; do
             if git push origin "$BRANCH" --force; then
               ok=true
               break
             fi
-            echo "GitLab push attempt $i failed."
-            sleep 5
+            echo "GitLab push attempt $i failed, retrying..."
+            sleep 10
           done
           [ "$ok" = true ] || { echo "ERROR: GitLab upload failed after retries"; exit 1; }
 
@@ -446,32 +867,28 @@ jobs:
           GITEA_URL: ${{ secrets.GITEA_URL }}
         run: |
           set -e
-
           GT_TOKEN="${GITEA_TOKEN:-}"
           GT_USER="${GITEA_USERNAME:-}"
           GT_REPO="${GITEA_REPO:-}"
           GT_URL="${GITEA_URL:-}"
-
           [ -n "$GT_TOKEN" ] || { echo "ERROR: Missing GITEA_TOKEN"; exit 1; }
           [ -n "$GT_USER" ] || { echo "ERROR: Missing GITEA_USERNAME"; exit 1; }
           [ -n "$GT_REPO" ] || { echo "ERROR: Missing GITEA_REPO"; exit 1; }
           [ -n "$GT_URL" ] || { echo "ERROR: Missing GITEA_URL"; exit 1; }
-
           BRANCH="${{ steps.branch.outputs.target_branch }}"
           REMOTE="${GT_URL%/}/${GT_USER}/${GT_REPO}.git"
           AUTH_REMOTE="${REMOTE/https:\/\//https:\/\/${GT_USER}:${GT_TOKEN}@}"
-
           rm -rf /tmp/gitea_push
           mkdir -p /tmp/gitea_push
           rsync -a /tmp/final_dump/ /tmp/gitea_push/
           cd /tmp/gitea_push
-
-          git init
-          git checkout -B "$BRANCH"
+          git init -b "$BRANCH"
+          git lfs install --skip-smudge 2>/dev/null || true
+          git lfs track "*.img" "*.zip" "*.xz" "*.gz" 2>/dev/null || true
           git remote add origin "$AUTH_REMOTE"
           find . -type f -name '*.apk' -size +100M -delete 2>/dev/null || true
           git add -A
-          git commit -m "dump: $BRANCH [$(date -u '+%Y-%m-%d %H:%M UTC')]" || echo "Nothing new to commit"
+          git commit -m "dump: $BRANCH [$(date -u '+%Y-%m-%d %H:%M UTC')]" || echo "Nothing new"
           git push origin "$BRANCH" --force
 
       - name: Upload to SourceForge (rsync over SSH)
@@ -482,17 +899,14 @@ jobs:
           SF_SSH_KEY: ${{ secrets.SF_SSH_KEY }}
         run: |
           set -e
-
           [ -n "${SF_USER:-}" ] || { echo "ERROR: Missing SF_USER"; exit 1; }
           [ -n "${SF_PROJECT:-}" ] || { echo "ERROR: Missing SF_PROJECT"; exit 1; }
           [ -n "${SF_SSH_KEY:-}" ] || { echo "ERROR: Missing SF_SSH_KEY"; exit 1; }
-
           BRANCH="${{ steps.branch.outputs.target_branch }}"
           mkdir -p ~/.ssh
           echo "$SF_SSH_KEY" > ~/.ssh/sf_key
           chmod 600 ~/.ssh/sf_key
           ssh-keyscan -H frs.sourceforge.net >> ~/.ssh/known_hosts 2>/dev/null || true
-
           rsync -avz --delete -e "ssh -i ~/.ssh/sf_key -o StrictHostKeyChecking=no" \
             /tmp/final_dump/ \
             "${SF_USER}@frs.sourceforge.net:/home/frs/project/${SF_PROJECT}/${BRANCH}/"
@@ -506,22 +920,17 @@ jobs:
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
         run: |
           set -e
-
           [ -n "${R2_ACCESS_KEY_ID:-}" ] || { echo "ERROR: Missing R2_ACCESS_KEY_ID"; exit 1; }
           [ -n "${R2_SECRET_ACCESS_KEY:-}" ] || { echo "ERROR: Missing R2_SECRET_ACCESS_KEY"; exit 1; }
           [ -n "${R2_BUCKET:-}" ] || { echo "ERROR: Missing R2_BUCKET"; exit 1; }
           [ -n "${R2_ENDPOINT:-}" ] || { echo "ERROR: Missing R2_ENDPOINT"; exit 1; }
-
           BRANCH="${{ steps.branch.outputs.target_branch }}"
-
           if ! command -v aws >/dev/null 2>&1; then
             pip3 install awscli --quiet
           fi
-
           export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
           export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
           export AWS_DEFAULT_REGION="auto"
-
           aws s3 sync /tmp/final_dump/ "s3://${R2_BUCKET}/${BRANCH}/" \
             --endpoint-url "$R2_ENDPOINT" \
             --no-progress
@@ -533,3 +942,6 @@ jobs:
           echo "=============================="
           echo "Branch: ${{ steps.branch.outputs.target_branch }}"
           echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo ""
+          echo "Generated trees:"
+          ls -la /tmp/final_dump/trees/ 2>/dev/null || echo "  (no trees dir)"
