@@ -220,6 +220,82 @@ jobs:
             fi
           done || true
 
+      - name: Generate device trees
+        run: |
+          set -e
+          TREES="/tmp/final_dump/trees"
+          mkdir -p "$TREES"
+
+          # Collect DTS/DTB/kernel from each boot image
+          for img in boot recovery vendor_boot vendor_kernel_boot init_boot dtbo; do
+            img_dir="/tmp/final_dump/$img"
+            if [ -d "$img_dir" ]; then
+              tree_dir="$TREES/$img"
+              mkdir -p "$tree_dir/dts" "$tree_dir/dtb"
+
+              # Decompile any DTB files found
+              find "$img_dir" -name '*.dtb' -type f 2>/dev/null | while IFS= read -r dtb; do
+                cp "$dtb" "$tree_dir/dtb/"
+                base=$(basename "$dtb" .dtb)
+                dtc -q -I dtb -O dts "$dtb" -o "$tree_dir/dts/${base}.dts" 2>/dev/null || true
+              done
+
+              # Copy already-decompiled DTS files
+              if [ -d "$img_dir/dts" ]; then
+                cp -rn "$img_dir/dts/"* "$tree_dir/dts/" 2>/dev/null || true
+              fi
+              if [ -d "$img_dir/dtb" ]; then
+                cp -rn "$img_dir/dtb/"* "$tree_dir/dtb/" 2>/dev/null || true
+              fi
+
+              # Copy kernel if present
+              if [ -f "$img_dir/kernel" ]; then
+                cp "$img_dir/kernel" "$tree_dir/kernel" 2>/dev/null || true
+              fi
+
+              # Copy info
+              if [ -f "$img_dir/info.txt" ]; then
+                cp "$img_dir/info.txt" "$tree_dir/info.txt"
+              fi
+
+              # If empty, remove
+              rmdir "$tree_dir/dts" "$tree_dir/dtb" 2>/dev/null || true
+            fi
+          done
+
+          # Copy kernel analysis files
+          for f in ikconfig kallsyms.txt boot.elf; do
+            [ -f "/tmp/final_dump/$f" ] && cp "/tmp/final_dump/$f" "$TREES/"
+          done
+
+          # Generate DTS from DTBO overlay
+          dtbo_dir="/tmp/final_dump/dtbo"
+          if [ -d "$dtbo_dir" ]; then
+            find "$dtbo_dir" -name '*.dtbo' -type f 2>/dev/null | while IFS= read -r dtbo; do
+              base=$(basename "$dtbo" .dtbo)
+              dtc -q -I dtb -O dts "$dtbo" -o "$TREES/dtbo/dts/${base}.dts" 2>/dev/null || true
+            done
+          fi
+
+          # Scan vendor partition for any DTB files
+          vendor_dir="/tmp/final_dump/vendor"
+          if [ -d "$vendor_dir" ]; then
+            mkdir -p "$TREES/vendor/dts"
+            find "$vendor_dir" -name '*.dtb' -type f 2>/dev/null | while IFS= read -r dtb; do
+              base=$(basename "$dtb" .dtb)
+              dtc -q -I dtb -O dts "$dtb" -o "$TREES/vendor/dts/${base}.dts" 2>/dev/null || true
+            done
+            rmdir "$TREES/vendor/dts" 2>/dev/null || true
+          fi
+
+          # Summary
+          echo "=== Device Trees Generated ===" > "$TREES/_trees_summary.txt"
+          echo "Source: ${{ steps.input.outputs.rom_url }}" >> "$TREES/_trees_summary.txt"
+          echo "Device: ${{ inputs.device_name }}" >> "$TREES/_trees_summary.txt"
+          echo "Branch: ${{ steps.branch.outputs.target_branch }}" >> "$TREES/_trees_summary.txt"
+          echo "" >> "$TREES/_trees_summary.txt"
+          find "$TREES" -type f | sort >> "$TREES/_trees_summary.txt"
+
       - name: Push to target branch (smart)
         if: inputs.upload_github_branch == 'true'
         run: |
