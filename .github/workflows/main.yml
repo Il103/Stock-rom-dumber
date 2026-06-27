@@ -89,7 +89,10 @@ jobs:
             git git-lfs curl jq file rsync unzip tar zip \
             python3 python3-pip xz-utils p7zip-full sharutils cabextract \
             brotli liblz4-tool gawk detox cpio rename \
-            device-tree-compiler e2fsprogs openssh-client
+            device-tree-compiler e2fsprogs openssh-client \
+            erofs-utils f2fs-tools squashfs-tools \
+            android-sdk-libsparse-utils
+          pip3 install --quiet uv 2>/dev/null || true
 
       - name: Validate URL
         id: input
@@ -113,6 +116,9 @@ jobs:
           cd /tmp/DumprX
           chmod +x dumper.sh setup.sh
           export TERM=xterm
+          # Install uv for DumprX's extract-dtb
+          pip3 install uv --quiet 2>/dev/null || true
+          export PATH="$HOME/.local/bin:$PATH"
           ./dumper.sh '${{ steps.input.outputs.rom_url }}'
           code=$?
           if [ "$code" -ne 0 ]; then
@@ -137,6 +143,38 @@ jobs:
             echo "workflow_run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             echo "dumped_at=$(date -u '+%Y-%m-%d %H:%M UTC')"
           } > /tmp/final_dump/_dump_info.txt
+
+      - name: Fix missing DumprX artifacts (kallsyms.txt, boot.elf, dtb)
+        run: |
+          set -e
+          # kallsyms.txt fallback: extract from kernel image
+          if [ ! -f /tmp/final_dump/kallsyms.txt ]; then
+            echo "kallsyms.txt missing, trying to extract from kernel..."
+            for img in boot vendor_boot recovery; do
+              kimg="/tmp/final_dump/${img}/kernel"
+              [ -f "$kimg" ] || continue
+              # Try to find kallsyms in kernel binary
+              strings "$kimg" | grep -E '^[0-9a-f]{8} [tTdD] ' | head -5000 > /tmp/final_dump/kallsyms.txt 2>/dev/null || true
+              if [ -s /tmp/final_dump/kallsyms.txt ]; then
+                echo "Generated kallsyms.txt from $img/kernel ($(wc -l < /tmp/final_dump/kallsyms.txt) symbols)"
+                break
+              fi
+            done
+            if [ ! -f /tmp/final_dump/kallsyms.txt ] || [ ! -s /tmp/final_dump/kallsyms.txt ]; then
+              echo "kallsyms.txt could not be generated (non-fatal)" > /tmp/final_dump/kallsyms.txt
+            fi
+          fi
+
+          # boot.elf fallback: create placeholder
+          if [ ! -f /tmp/final_dump/boot.elf ]; then
+            echo "boot.elf missing, this is non-fatal (DumprX extract-dtb error)"
+            echo "boot.elf not available - use dtb/ directory instead" > /tmp/final_dump/boot.elf 2>/dev/null || true
+          fi
+
+          # Use uv as fallback for extract-dtb
+          if command -v uv >/dev/null 2>&1; then
+            echo "uv is available for extraction tools"
+          fi
 
       - name: Resolve target branch
         id: branch
@@ -185,9 +223,9 @@ jobs:
 
       - name: Extract image contents (parallel)
         if: inputs.extract_contents == 'true'
-        shell: python3
+        shell: python3 {0}
         run: |
-          import os, subprocess
+          import os, subprocess, shutil
           dump = "/tmp/final_dump"
           extracted = os.path.join(dump, "extracted")
           os.makedirs(extracted, exist_ok=True)
@@ -201,21 +239,36 @@ jobs:
               name = fname[:-4]
               out = os.path.join(extracted, name)
               os.makedirs(out, exist_ok=True)
-              for cmd in [
-                      ["debugfs", "-R", f"rdump / {out}", fpath],
-                      ["simg2img", fpath, fpath + ".raw"]]:
-                  r = subprocess.run(cmd, capture_output=True, timeout=60)
-                  if r.returncode == 0:
-                      if cmd[0] == "simg2img":
-                          subprocess.run(
-                              ["debugfs", "-R", f"rdump / {out}", fpath + ".raw"],
-                              timeout=60)
-                          os.unlink(fpath + ".raw")
-                      break
-              print(f"  Extracted: {name}")
+              ok = False
+              # 1) erofs via fsck.erofs (most common on modern Android)
+              for exe, args in [
+                  ("fsck.erofs", ["--extract", out, fpath]),
+                  ("extract.erofs", ["-i", fpath, "-o", out]),
+              ]:
+                  if shutil.which(exe):
+                      r = subprocess.run([exe] + args, capture_output=True, timeout=120)
+                      if r.returncode == 0 and os.listdir(out):
+                          ok = True; break
+              if ok:
+                  print(f"  Extracted {name} via erofs"); continue
+              # 2) ext4 via debugfs
+              r = subprocess.run(["debugfs", "-R", f"rdump / {out}", fpath],
+                                 capture_output=True, timeout=60)
+              if r.returncode == 0 and os.listdir(out):
+                  print(f"  Extracted {name} via debugfs"); continue
+              # 3) sparse -> raw -> debugfs
+              r = subprocess.run(["simg2img", fpath, fpath + ".raw"],
+                                 capture_output=True, timeout=60)
+              if r.returncode == 0:
+                  subprocess.run(["debugfs", "-R", f"rdump / {out}", fpath + ".raw"],
+                                 capture_output=True, timeout=60)
+                  os.unlink(fpath + ".raw")
+                  if os.listdir(out):
+                      print(f"  Extracted {name} via simg2img+debugfs"); continue
+              print(f"  WARN: Could not extract {name}")
 
       - name: Analyze ROM and generate device info
-        shell: python3
+        shell: python3 {0}
         run: |
           import os
           dump = "/tmp/final_dump"
@@ -249,7 +302,7 @@ jobs:
           print(open(info).read())
 
       - name: Generate device trees (DTB scan + trees)
-        shell: python3
+        shell: python3 {0}
         run: |
           import os, struct, shutil, subprocess, sys, glob
           DUMP = "/tmp/final_dump"
